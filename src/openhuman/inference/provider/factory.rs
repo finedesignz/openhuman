@@ -174,6 +174,30 @@ pub fn create_chat_provider_from_string(
         verify_session_active(config)?;
     }
 
+    if let Some(model_with_temp) =
+        p.strip_prefix(crate::openhuman::inference::provider::claude_code::PROVIDER_PREFIX)
+    {
+        let (model, _temperature_override) = split_model_and_temperature(model_with_temp);
+        if model.is_empty() {
+            anyhow::bail!(
+                "[chat-factory] provider string '{}' for role '{}' has an empty model — \
+                 use 'claude-code:<model-id>'",
+                p,
+                role
+            );
+        }
+        log::debug!(
+            "[providers][chat-factory] building claude-code CLI provider model={}",
+            model
+        );
+        let p_box: Box<dyn Provider> = Box::new(
+            crate::openhuman::inference::provider::claude_code::ClaudeCodeProvider::new(
+                model.clone(),
+            ),
+        );
+        return Ok((p_box, model));
+    }
+
     if let Some(model_with_temp) = p.strip_prefix(OLLAMA_PROVIDER_PREFIX) {
         let (model, temperature_override) = split_model_and_temperature(model_with_temp);
         if model.is_empty() {

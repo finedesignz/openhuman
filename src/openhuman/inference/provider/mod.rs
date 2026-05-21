@@ -5,6 +5,7 @@
 //! providers, HTTP endpoint) share a single domain root.
 
 pub mod billing_error;
+pub mod claude_code;
 pub mod compatible;
 pub mod compatible_dump;
 pub mod compatible_parse;

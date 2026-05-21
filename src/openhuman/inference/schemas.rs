@@ -149,6 +149,7 @@ pub fn all_controller_schemas() -> Vec<ControllerSchema> {
         schemas("chat"),
         schemas("should_react"),
         schemas("analyze_sentiment"),
+        schemas("claude_code_status"),
     ]
 }
 
@@ -233,6 +234,10 @@ pub fn all_registered_controllers() -> Vec<RegisteredController> {
         RegisteredController {
             schema: schemas("analyze_sentiment"),
             handler: handle_inference_analyze_sentiment,
+        },
+        RegisteredController {
+            schema: schemas("claude_code_status"),
+            handler: handle_inference_claude_code_status,
         },
     ]
 }
@@ -450,6 +455,16 @@ pub fn schemas(function: &str) -> ControllerSchema {
             description: "Classify the emotion and valence of a user message with the inference provider.",
             inputs: vec![required_string("message", "User message content to classify.")],
             outputs: vec![json_output("sentiment", "Sentiment analysis payload.")],
+        },
+        "claude_code_status" => ControllerSchema {
+            namespace: "inference",
+            function: "claude_code_status",
+            description: "Probe the local `claude` CLI binary (Claude Code CLI provider) and return install + version status.",
+            inputs: vec![],
+            outputs: vec![json_output(
+                "status",
+                "CliStatus payload: ok | not_installed | outdated | unusable, with version + path when present.",
+            )],
         },
         other => panic!("unknown inference schema: {other}"),
     }
@@ -807,6 +822,17 @@ fn handle_inference_analyze_sentiment(params: Map<String, Value>) -> ControllerF
             crate::openhuman::inference::rpc::inference_analyze_sentiment(&config, &p.message)
                 .await?,
         )
+    })
+}
+
+fn handle_inference_claude_code_status(_params: Map<String, Value>) -> ControllerFuture {
+    Box::pin(async move {
+        let status = tokio::task::spawn_blocking(
+            crate::openhuman::inference::provider::claude_code::version_check::probe,
+        )
+        .await
+        .map_err(|e| format!("claude_code_status join error: {e}"))?;
+        to_json(RpcOutcome::new(status, vec![]))
     })
 }
 
