@@ -47,6 +47,7 @@ import {
 } from '../../../utils/tauriCommands/heartbeat';
 import { ConfirmationModal } from '../../intelligence/ConfirmationModal';
 import SettingsHeader from '../components/SettingsHeader';
+import { ClaudeCodeStatusCard } from './ai/ClaudeCodeStatusCard';
 import { useSettingsNavigation } from '../hooks/useSettingsNavigation';
 import { useReembedBackfillModal } from './useReembedBackfillModal';
 
@@ -83,7 +84,8 @@ type WorkloadGroup = 'chat' | 'background';
 type ProviderRef =
   | { kind: 'openhuman' }
   | { kind: 'cloud'; providerSlug: string; model: string; temperature?: number | null }
-  | { kind: 'local'; model: string; temperature?: number | null };
+  | { kind: 'local'; model: string; temperature?: number | null }
+  | { kind: 'claude-code'; model: string; temperature?: number | null };
 
 type Workload = { id: WorkloadId; group: WorkloadGroup; label: string; description: string };
 
@@ -752,6 +754,7 @@ function summarizeSpendSample(transactions: CreditTransaction[]) {
 function describeProvider(ref: ProviderRef, providers: CloudProvider[]): string {
   if (ref.kind === 'openhuman') return 'OpenHuman';
   if (ref.kind === 'local') return `Local ${ref.model}`;
+  if (ref.kind === 'claude-code') return `Claude Code CLI ${ref.model || 'default model'}`;
   const provider = providers.find(p => p.slug === ref.providerSlug);
   return `${provider?.label ?? ref.providerSlug} ${ref.model || 'custom model'}`;
 }
@@ -2041,6 +2044,7 @@ const AIPanel = ({ embedded = false }: AIPanelProps = {}) => {
       )}
 
       <div className={embedded ? 'space-y-6' : 'space-y-6 p-4'}>
+        <ClaudeCodeStatusCard />
         {/* ═══════════════════════════════════════════════════════════════
             AUTH — provider authentication (cloud providers + local Ollama
             setup). Everything the user needs to wire a model up.

@@ -237,6 +237,34 @@ export async function openhumanGetClientConfig(): Promise<CommandResponse<Client
   });
 }
 
+/**
+ * Status payload for the Claude Code CLI provider — mirrors Rust
+ * `claude_code::types::CliStatus`. The `status` discriminator is the
+ * snake_case Serde rename; `path` and `version` may be absent depending
+ * on which variant fired.
+ */
+export type ClaudeCodeStatus =
+  | { status: 'ok'; version: string; path: string }
+  | { status: 'not_installed' }
+  | { status: 'outdated'; version: string; min_required: string; path: string }
+  | { status: 'unusable'; path: string; reason: string };
+
+/**
+ * Probe the local `claude` CLI binary (Claude Code CLI provider). Returns
+ * install + version status; never throws on a missing binary — the
+ * `not_installed` variant signals that case explicitly.
+ */
+export async function openhumanClaudeCodeStatus(): Promise<
+  CommandResponse<ClaudeCodeStatus>
+> {
+  if (!isTauri()) {
+    throw new Error('Not running in Tauri');
+  }
+  return await callCoreRpc<CommandResponse<ClaudeCodeStatus>>({
+    method: 'openhuman.inference_claude_code_status',
+  });
+}
+
 export async function openhumanUpdateModelSettings(
   update: ModelSettingsUpdate
 ): Promise<CommandResponse<ConfigSnapshot>> {
