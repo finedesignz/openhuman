@@ -186,15 +186,26 @@ pub fn create_chat_provider_from_string(
                 role
             );
         }
+        let workspace = config
+            .config_path
+            .parent()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                directories::UserDirs::new()
+                    .map(|d| d.home_dir().join(".openhuman"))
+                    .unwrap_or_else(|| std::path::PathBuf::from(".openhuman"))
+            });
         log::debug!(
-            "[providers][chat-factory] building claude-code CLI provider model={}",
-            model
+            "[providers][chat-factory] building claude-code CLI provider model={} workspace={}",
+            model,
+            workspace.display()
         );
-        let p_box: Box<dyn Provider> = Box::new(
-            crate::openhuman::inference::provider::claude_code::ClaudeCodeProvider::new(
+        let provider =
+            crate::openhuman::inference::provider::claude_code::ClaudeCodeProvider::from_env(
                 model.clone(),
-            ),
-        );
+                workspace,
+            )?;
+        let p_box: Box<dyn Provider> = Box::new(provider);
         return Ok((p_box, model));
     }
 
