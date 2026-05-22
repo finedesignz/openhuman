@@ -23,9 +23,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::sync::Semaphore;
 
-use super::traits::{
-    ChatMessage, ChatRequest, ChatResponse, Provider, ProviderCapabilities,
-};
+use super::traits::{ChatMessage, ChatRequest, ChatResponse, Provider, ProviderCapabilities};
 
 /// Provider string prefix used in the factory grammar: `claude-code:<model>`.
 pub const PROVIDER_PREFIX: &str = "claude-code:";

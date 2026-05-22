@@ -165,10 +165,7 @@ impl EventMapper {
                         input_accum: String::new(),
                     },
                 );
-                vec![ProviderDelta::ToolCallStart {
-                    call_id,
-                    tool_name,
-                }]
+                vec![ProviderDelta::ToolCallStart { call_id, tool_name }]
             }
             _ => Vec::new(),
         }

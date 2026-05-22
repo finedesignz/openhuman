@@ -30,9 +30,7 @@ describe('ClaudeCodeStatusCard', () => {
     probe.mockResolvedValueOnce({ result: { status: 'not_installed' } });
     render(<ClaudeCodeStatusCard />);
     await waitFor(() => {
-      expect(
-        screen.getByText(/Claude Code CLI is not installed/i)
-      ).toBeInTheDocument();
+      expect(screen.getByText(/Claude Code CLI is not installed/i)).toBeInTheDocument();
     });
   });
 
@@ -47,9 +45,7 @@ describe('ClaudeCodeStatusCard', () => {
     });
     render(<ClaudeCodeStatusCard />);
     await waitFor(() => {
-      expect(
-        screen.getByText(/Outdated — found 1\.9\.0, need ≥ 2\.0\.0/)
-      ).toBeInTheDocument();
+      expect(screen.getByText(/Outdated — found 1\.9\.0, need ≥ 2\.0\.0/)).toBeInTheDocument();
     });
   });
 
@@ -64,15 +60,11 @@ describe('ClaudeCodeStatusCard', () => {
   it('re-probes when Refresh is clicked', async () => {
     probe
       .mockResolvedValueOnce({ result: { status: 'not_installed' } })
-      .mockResolvedValueOnce({
-        result: { status: 'ok', version: '2.0.4', path: '/x/y/claude' },
-      });
+      .mockResolvedValueOnce({ result: { status: 'ok', version: '2.0.4', path: '/x/y/claude' } });
     const user = userEvent.setup();
     render(<ClaudeCodeStatusCard />);
     await waitFor(() => {
-      expect(
-        screen.getByText(/Claude Code CLI is not installed/i)
-      ).toBeInTheDocument();
+      expect(screen.getByText(/Claude Code CLI is not installed/i)).toBeInTheDocument();
     });
     await user.click(screen.getByRole('button', { name: /Refresh/i }));
     await waitFor(() => {

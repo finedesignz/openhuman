@@ -136,10 +136,7 @@ impl StreamJsonParser {
             },
             "rate_limit_event" => ClaudeCodeEvent::RateLimit { raw: v },
             "result" => {
-                let subtype = v
-                    .get("subtype")
-                    .and_then(Value::as_str)
-                    .map(str::to_string);
+                let subtype = v.get("subtype").and_then(Value::as_str).map(str::to_string);
                 let usage = v.get("usage").cloned();
                 let total_cost_usd = v.get("total_cost_usd").and_then(Value::as_f64);
                 ClaudeCodeEvent::Result {
@@ -194,7 +191,9 @@ mod tests {
     #[test]
     fn flushes_trailing_line_on_end() {
         let mut p = StreamJsonParser::new();
-        assert!(p.feed(r#"{"type":"result","subtype":"success"}"#).is_empty());
+        assert!(p
+            .feed(r#"{"type":"result","subtype":"success"}"#)
+            .is_empty());
         let events = p.end();
         assert_eq!(events.len(), 1);
         assert!(matches!(events[0], ClaudeCodeEvent::Result { .. }));

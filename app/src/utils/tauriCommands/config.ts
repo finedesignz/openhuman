@@ -254,9 +254,7 @@ export type ClaudeCodeStatus =
  * install + version status; never throws on a missing binary — the
  * `not_installed` variant signals that case explicitly.
  */
-export async function openhumanClaudeCodeStatus(): Promise<
-  CommandResponse<ClaudeCodeStatus>
-> {
+export async function openhumanClaudeCodeStatus(): Promise<CommandResponse<ClaudeCodeStatus>> {
   if (!isTauri()) {
     throw new Error('Not running in Tauri');
   }

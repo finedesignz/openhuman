@@ -20,10 +20,7 @@ use crate::openhuman::inference::provider::traits::ChatMessage;
 pub fn build_stdin(messages: &[ChatMessage], is_new_session: bool) -> Vec<u8> {
     let mut out = String::new();
     let to_emit: Vec<&ChatMessage> = if is_new_session {
-        messages
-            .iter()
-            .filter(|m| m.role != "system")
-            .collect()
+        messages.iter().filter(|m| m.role != "system").collect()
     } else {
         // Resume: only the trailing user turn matters.
         messages

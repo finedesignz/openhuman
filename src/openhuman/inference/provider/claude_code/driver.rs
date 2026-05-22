@@ -17,9 +17,7 @@ use super::event_mapper::EventMapper;
 use super::input_builder::build_stdin;
 use super::session_store::{generate_uuid_v4, is_uuid_v4, SessionStore};
 use super::stream_parser::StreamJsonParser;
-use crate::openhuman::inference::provider::traits::{
-    ChatMessage, ChatResponse, ProviderDelta,
-};
+use crate::openhuman::inference::provider::traits::{ChatMessage, ChatResponse, ProviderDelta};
 
 /// Builtin CC tools disabled in v1 so OpenHuman's MCP-exposed surface is
 /// authoritative. CC's `mcp__openhuman__*` tools remain enabled.
@@ -71,7 +69,10 @@ fn write_mcp_config(dir: &std::path::Path, core_bin: &std::path::Path) -> std::i
             }
         }
     });
-    std::fs::write(&path, serde_json::to_string_pretty(&cfg).unwrap_or_default())?;
+    std::fs::write(
+        &path,
+        serde_json::to_string_pretty(&cfg).unwrap_or_default(),
+    )?;
     Ok(path)
 }
 
@@ -141,7 +142,11 @@ pub async fn run_turn(ctx: TurnContext<'_>) -> anyhow::Result<ChatResponse> {
         "--model".into(),
         ctx.model.clone(),
     ];
-    if let Some(sp) = ctx.append_system_prompt.as_ref().filter(|s| !s.trim().is_empty()) {
+    if let Some(sp) = ctx
+        .append_system_prompt
+        .as_ref()
+        .filter(|s| !s.trim().is_empty())
+    {
         args.push("--append-system-prompt".into());
         args.push(sp.clone());
     }
