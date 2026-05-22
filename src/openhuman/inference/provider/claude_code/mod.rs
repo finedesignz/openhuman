@@ -125,6 +125,7 @@ impl ClaudeCodeProvider {
 
         let model = model_override.unwrap_or(&self.model).to_string();
 
+        let openhuman_core_bin = std::env::current_exe().ok();
         let turn = driver::TurnContext {
             bin_path: self.bin_path.clone(),
             workspace_dir: self.workspace_dir.clone(),
@@ -135,6 +136,7 @@ impl ClaudeCodeProvider {
             session_store: self.session_store.clone(),
             stream: request.stream,
             anthropic_api_key: self.anthropic_api_key.clone(),
+            openhuman_core_bin,
         };
         driver::run_turn(turn).await
     }

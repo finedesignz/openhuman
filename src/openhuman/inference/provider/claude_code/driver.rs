@@ -2,13 +2,13 @@
 //! event mapper, and return an aggregated `ChatResponse`.
 //!
 //! The driver does *not* own concurrency limits; the `ClaudeCodeProvider`
-//! holds a `Semaphore` and acquires a permit before calling this. The
-//! driver also does *not* own MCP — Phase 3 will wire `--mcp-config`.
+//! holds a `Semaphore` and acquires a permit before calling this.
 
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 
+use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::sync::mpsc;
@@ -20,6 +20,23 @@ use super::stream_parser::StreamJsonParser;
 use crate::openhuman::inference::provider::traits::{
     ChatMessage, ChatResponse, ProviderDelta,
 };
+
+/// Builtin CC tools disabled in v1 so OpenHuman's MCP-exposed surface is
+/// authoritative. CC's `mcp__openhuman__*` tools remain enabled.
+const DISALLOWED_CC_BUILTINS: &[&str] = &[
+    "Bash",
+    "BashOutput",
+    "KillShell",
+    "Read",
+    "Write",
+    "Edit",
+    "Glob",
+    "Grep",
+    "WebFetch",
+    "WebSearch",
+    "TodoWrite",
+    "Task",
+];
 
 /// One CC chat turn.
 pub struct TurnContext<'a> {
@@ -34,6 +51,28 @@ pub struct TurnContext<'a> {
     /// Optional explicit `ANTHROPIC_API_KEY` to set on the child. When
     /// `None`, the CLI falls back to its own `~/.claude/.credentials.json`.
     pub anthropic_api_key: Option<String>,
+    /// Path to the OpenHuman core binary (`openhuman-core`). CC spawns it
+    /// with `mcp` to get a stdio MCP server exposing OpenHuman tools.
+    /// When `None`, MCP is not wired and CC runs with no extra tools.
+    pub openhuman_core_bin: Option<PathBuf>,
+}
+
+/// Write a CC `--mcp-config` JSON file that spawns `openhuman-core mcp`
+/// as a stdio MCP server. Returns the on-disk path; caller cleans up.
+fn write_mcp_config(dir: &std::path::Path, core_bin: &std::path::Path) -> std::io::Result<PathBuf> {
+    let path = dir.join("openhuman-mcp-config.json");
+    let cfg = json!({
+        "mcpServers": {
+            "openhuman": {
+                "type": "stdio",
+                "command": core_bin.display().to_string(),
+                "args": ["mcp"],
+                "env": {}
+            }
+        }
+    });
+    std::fs::write(&path, serde_json::to_string_pretty(&cfg).unwrap_or_default())?;
+    Ok(path)
 }
 
 /// Run one turn against the `claude` CLI. Awaits process exit. Forwards
@@ -55,6 +94,33 @@ pub async fn run_turn(ctx: TurnContext<'_>) -> anyhow::Result<ChatResponse> {
     } else {
         stored.expect("checked Some above")
     };
+
+    // Set up a per-turn scratch dir for --mcp-config and any other transient
+    // state. Best-effort cleanup at end of turn.
+    let scratch = tempfile::Builder::new()
+        .prefix("openhuman-cc-")
+        .tempdir()
+        .map_err(|e| anyhow::anyhow!("create scratch dir: {e}"))?;
+    let mut mcp_config_path: Option<PathBuf> = None;
+    if let Some(core_bin) = ctx.openhuman_core_bin.as_ref() {
+        match write_mcp_config(scratch.path(), core_bin) {
+            Ok(p) => {
+                log::debug!(
+                    "[claude-code][driver] wrote mcp-config path={} core_bin={}",
+                    p.display(),
+                    core_bin.display()
+                );
+                mcp_config_path = Some(p);
+            }
+            Err(e) => log::warn!(
+                "[claude-code][driver] failed to write mcp-config: {e}; CC will run without OpenHuman MCP tools"
+            ),
+        }
+    } else {
+        log::debug!(
+            "[claude-code][driver] no openhuman_core_bin provided; CC running without OpenHuman MCP tools"
+        );
+    }
 
     let mut args: Vec<String> = vec![
         "-p".into(),
@@ -79,6 +145,17 @@ pub async fn run_turn(ctx: TurnContext<'_>) -> anyhow::Result<ChatResponse> {
         args.push("--append-system-prompt".into());
         args.push(sp.clone());
     }
+    if let Some(p) = mcp_config_path.as_ref() {
+        args.push("--mcp-config".into());
+        args.push(p.display().to_string());
+        args.push("--strict-mcp-config".into());
+    }
+    // Disable CC's built-in tools so OpenHuman's MCP surface stays
+    // authoritative. We disable per-builtin instead of using
+    // `--dangerously-skip-permissions` to keep the permission-prompt
+    // floor intact for any tools we forgot to list.
+    args.push("--disallowedTools".into());
+    args.push(DISALLOWED_CC_BUILTINS.join(","));
 
     log::debug!(
         "[claude-code][driver] spawn bin={} model={} is_new={} cc_session_id={}",
