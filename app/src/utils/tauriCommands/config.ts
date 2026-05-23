@@ -1,6 +1,7 @@
 /**
  * Config and settings commands.
  */
+import { invoke } from '@tauri-apps/api/core';
 import debug from 'debug';
 
 import { callCoreRpc } from '../../services/coreRpcClient';
@@ -293,6 +294,21 @@ export async function openhumanClaudeCodeAuthStatus(): Promise<
   return await callCoreRpc<CommandResponse<ClaudeCodeAuthStatus>>({
     method: 'openhuman.inference_claude_code_auth_status',
   });
+}
+
+/**
+ * Open the user's native terminal and run `claude login` inside it. The
+ * CLI's OAuth flow is interactive, so we can't host it in-app — we
+ * detach into a terminal window and let the user complete the flow
+ * there, then click Recheck back in the settings card.
+ *
+ * Returns the name of the terminal emulator that was launched.
+ */
+export async function openhumanClaudeCodeLoginLaunch(): Promise<string> {
+  if (!isTauri()) {
+    throw new Error('Not running in Tauri');
+  }
+  return await invoke<string>('claude_code_login_launch');
 }
 
 export async function openhumanUpdateModelSettings(

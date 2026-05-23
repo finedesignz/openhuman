@@ -47,8 +47,8 @@ import {
 } from '../../../utils/tauriCommands/heartbeat';
 import { ConfirmationModal } from '../../intelligence/ConfirmationModal';
 import SettingsHeader from '../components/SettingsHeader';
-import { ClaudeCodeStatusCard } from './ai/ClaudeCodeStatusCard';
 import { useSettingsNavigation } from '../hooks/useSettingsNavigation';
+import { ClaudeCodeStatusCard } from './ai/ClaudeCodeStatusCard';
 import { useReembedBackfillModal } from './useReembedBackfillModal';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1596,7 +1596,15 @@ interface CustomRoutingDialogProps {
   onSubmit: (next: ProviderRef) => void;
 }
 
-type CustomDialogSource = { kind: 'cloud'; providerSlug: string } | { kind: 'local' };
+type CustomDialogSource =
+  | { kind: 'cloud'; providerSlug: string }
+  | { kind: 'local' }
+  | { kind: 'claude-code' };
+
+/** Default model identifier presented when the user first picks the
+ * Claude Code CLI source. The CLI accepts any model id the underlying
+ * Claude account can run, so this is just a sensible starting point. */
+const CLAUDE_CODE_DEFAULT_MODEL = 'sonnet-4-5';
 
 function humanizeModelId(id: string): string {
   return id.replace(/[-_]/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
@@ -1622,19 +1630,23 @@ const CustomRoutingDialog = ({
       ? { kind: 'cloud', providerSlug: initial.providerSlug }
       : initial.kind === 'local'
         ? { kind: 'local' }
-        : customCloud[0]
-          ? { kind: 'cloud', providerSlug: customCloud[0].slug }
-          : localAvailable
-            ? { kind: 'local' }
-            : null;
+        : initial.kind === 'claude-code'
+          ? { kind: 'claude-code' }
+          : customCloud[0]
+            ? { kind: 'cloud', providerSlug: customCloud[0].slug }
+            : localAvailable
+              ? { kind: 'local' }
+              : null;
 
   const [source, setSource] = useState<CustomDialogSource | null>(initialSource);
   const [model, setModel] = useState<string>(() => {
-    if (initial.kind === 'cloud' || initial.kind === 'local') return initial.model;
+    if (initial.kind === 'cloud' || initial.kind === 'local' || initial.kind === 'claude-code')
+      return initial.model;
     if (initialSource?.kind === 'cloud') {
       const p = customCloud.find(c => c.slug === initialSource.providerSlug);
       return p ? '' : '';
     }
+    if (initialSource?.kind === 'claude-code') return CLAUDE_CODE_DEFAULT_MODEL;
     return localModels[0]?.id ?? '';
   });
   const [cloudModels, setCloudModels] = useState<ModelInfo[]>([]);
@@ -1644,7 +1656,9 @@ const CustomRoutingDialog = ({
   // Optional temperature override for this workload. `null` = use provider/global default;
   // a finite number means "send `temperature: X` upstream for this workload only".
   const [temperature, setTemperature] = useState<number | null>(
-    initial.kind === 'cloud' || initial.kind === 'local' ? (initial.temperature ?? null) : null
+    initial.kind === 'cloud' || initial.kind === 'local' || initial.kind === 'claude-code'
+      ? (initial.temperature ?? null)
+      : null
   );
 
   const selectedCloud =
@@ -1704,11 +1718,18 @@ const CustomRoutingDialog = ({
         model: model.trim(),
         temperature: temp,
       });
+    } else if (source.kind === 'claude-code') {
+      onSubmit({ kind: 'claude-code', model: model.trim(), temperature: temp });
     } else {
       onSubmit({ kind: 'local', model: model.trim(), temperature: temp });
     }
   };
 
+  // Claude Code CLI is always available as a source — its presence/health
+  // is surfaced in the dedicated `ClaudeCodeStatusCard` above the routing
+  // dialog. We don't gate the picker on the binary being installed; if
+  // it's missing the factory grammar still parses and the provider
+  // surfaces a clear error on first chat.
   const noProviders = customCloud.length === 0 && !localAvailable;
 
   return (
@@ -1767,6 +1788,9 @@ const CustomRoutingDialog = ({
                   } else if (kind === 'cloud') {
                     setSource({ kind: 'cloud', providerSlug: slug });
                     setModel('');
+                  } else if (kind === 'claude-code') {
+                    setSource({ kind: 'claude-code' });
+                    setModel(CLAUDE_CODE_DEFAULT_MODEL);
                   }
                 }}
                 className="rounded-lg border border-stone-300 dark:border-neutral-700 bg-white dark:bg-neutral-900 px-3 py-2 text-sm text-stone-900 dark:text-neutral-100 focus:border-primary-500 focus:outline-none focus:ring-1 focus:ring-primary-500">
@@ -1776,6 +1800,7 @@ const CustomRoutingDialog = ({
                   </option>
                 ))}
                 {localAvailable && <option value="local:">{t('settings.ai.localOllama')}</option>}
+                <option value="claude-code:">Claude Code CLI</option>
               </select>
             </div>
 
@@ -1794,6 +1819,20 @@ const CustomRoutingDialog = ({
                     </option>
                   ))}
                 </select>
+              ) : source?.kind === 'claude-code' ? (
+                <div className="space-y-1.5">
+                  <input
+                    type="text"
+                    value={model}
+                    onChange={e => setModel(e.target.value)}
+                    placeholder="sonnet-4-5"
+                    className="w-full rounded-lg border border-stone-300 dark:border-neutral-700 bg-white dark:bg-neutral-900 px-3 py-2 text-sm font-mono text-stone-900 dark:text-neutral-100 placeholder-stone-400 dark:placeholder-neutral-500 focus:border-primary-500 focus:outline-none focus:ring-1 focus:ring-primary-500"
+                  />
+                  <p className="text-[11px] text-stone-500 dark:text-neutral-400">
+                    Any model id your Claude account can run (e.g. <code>sonnet-4-5</code>,{' '}
+                    <code>opus-4-7</code>). Passed verbatim to <code>claude --model</code>.
+                  </p>
+                </div>
               ) : cloudModelsLoading ? (
                 <select
                   disabled

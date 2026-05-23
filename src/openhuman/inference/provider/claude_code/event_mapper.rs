@@ -69,10 +69,19 @@ impl EventMapper {
             ClaudeCodeEvent::Result {
                 subtype,
                 usage,
-                total_cost_usd: _,
+                total_cost_usd,
                 ..
             } => {
-                self.usage = usage.as_ref().map(parse_usage);
+                let mut parsed = usage.as_ref().map(parse_usage);
+                // CC stream emits `total_cost_usd` on the terminal `result`
+                // event — surface it as `UsageInfo.charged_amount_usd` so
+                // downstream cost.rs can record it without re-pricing
+                // tokens × model rates.
+                if let Some(cost) = total_cost_usd {
+                    let usage = parsed.get_or_insert_with(UsageInfo::default);
+                    usage.charged_amount_usd = cost;
+                }
+                self.usage = parsed;
                 if subtype.as_deref() == Some("error") && self.error.is_none() {
                     self.error = Some("claude reported `result.subtype=error`".into());
                 }
@@ -329,6 +338,22 @@ mod tests {
         assert_eq!(u.input_tokens, 100);
         assert_eq!(u.output_tokens, 50);
         assert_eq!(u.cached_input_tokens, 25);
+        // cost wired through from total_cost_usd
+        assert!((u.charged_amount_usd - 0.001).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn cost_surfaced_even_without_usage_object() {
+        let mut m = EventMapper::new();
+        m.handle(ClaudeCodeEvent::Result {
+            subtype: Some("success".into()),
+            usage: None,
+            total_cost_usd: Some(0.05),
+            raw: Value::Null,
+        });
+        let u = m.usage.as_ref().expect("usage synthesized for cost-only result");
+        assert_eq!(u.input_tokens, 0);
+        assert!((u.charged_amount_usd - 0.05).abs() < f64::EPSILON);
     }
 
     #[test]

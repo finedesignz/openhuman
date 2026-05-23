@@ -6,16 +6,20 @@ import { ClaudeCodeStatusCard } from '../ClaudeCodeStatusCard';
 
 const probe = vi.fn();
 const authProbe = vi.fn();
+const loginLaunch = vi.fn();
 
 vi.mock('../../../../../utils/tauriCommands/config', () => ({
   openhumanClaudeCodeStatus: () => probe(),
   openhumanClaudeCodeAuthStatus: () => authProbe(),
+  openhumanClaudeCodeLoginLaunch: () => loginLaunch(),
 }));
 
 describe('ClaudeCodeStatusCard', () => {
   beforeEach(() => {
     probe.mockReset();
     authProbe.mockReset();
+    loginLaunch.mockReset();
+    loginLaunch.mockResolvedValue('cmd');
     // Default auth response — individual tests override as needed.
     authProbe.mockResolvedValue({ result: { source: 'none', last_checked: 0 } });
   });
@@ -71,7 +75,7 @@ describe('ClaudeCodeStatusCard', () => {
     await waitFor(() => {
       expect(screen.getByText(/Claude Code CLI is not installed/i)).toBeInTheDocument();
     });
-    await user.click(screen.getByRole('button', { name: /Refresh/i }));
+    await user.click(screen.getByRole('button', { name: /Probe/i }));
     await waitFor(() => {
       expect(screen.getByText(/Installed \(2\.0\.4\)/)).toBeInTheDocument();
     });
@@ -115,6 +119,16 @@ describe('ClaudeCodeStatusCard', () => {
       expect(screen.getByText(/Not signed in\./)).toBeInTheDocument();
     });
     expect(screen.getByText(/claude login/)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Sign in with Claude/i })).toBeInTheDocument();
+  });
+
+  it('Sign in with Claude button launches login terminal', async () => {
+    probe.mockResolvedValueOnce({ result: { status: 'ok', version: '2.0.4', path: '/x/y' } });
+    const user = userEvent.setup();
+    render(<ClaudeCodeStatusCard />);
+    const btn = await screen.findByRole('button', { name: /Sign in with Claude/i });
+    await user.click(btn);
+    expect(loginLaunch).toHaveBeenCalledTimes(1);
   });
 
   it('Recheck triggers a second auth probe without re-running version probe', async () => {

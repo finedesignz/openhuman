@@ -4,6 +4,7 @@ import {
   type ClaudeCodeAuthStatus,
   type ClaudeCodeStatus,
   openhumanClaudeCodeAuthStatus,
+  openhumanClaudeCodeLoginLaunch,
   openhumanClaudeCodeStatus,
 } from '../../../../utils/tauriCommands/config';
 
@@ -74,7 +75,7 @@ export function ClaudeCodeStatusCard() {
           }}
           disabled={loading}
           className="text-xs text-neutral-500 hover:text-neutral-900 disabled:opacity-50 dark:text-neutral-400 dark:hover:text-neutral-100">
-          {loading ? 'Probing…' : 'Refresh'}
+          {loading ? 'Probing…' : 'Probe'}
         </button>
       </header>
       <StatusBody status={status} error={error} />
@@ -197,12 +198,48 @@ function AuthBody({ auth, error }: { auth: ClaudeCodeAuthStatus | null; error: s
       </p>
     );
   }
+  return <SignedOut />;
+}
+
+function SignedOut() {
+  const [launchError, setLaunchError] = useState<string | null>(null);
+  const [launching, setLaunching] = useState(false);
+
+  const launchLogin = async () => {
+    setLaunching(true);
+    setLaunchError(null);
+    try {
+      await openhumanClaudeCodeLoginLaunch();
+    } catch (err) {
+      setLaunchError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setLaunching(false);
+    }
+  };
+
   return (
-    <div className="space-y-1">
+    <div className="space-y-2">
       <p className="text-xs text-amber-600 dark:text-amber-400">Not signed in.</p>
+      <div className="flex flex-wrap items-center gap-2">
+        <button
+          type="button"
+          onClick={() => {
+            void launchLogin();
+          }}
+          disabled={launching}
+          className="rounded-md bg-neutral-900 px-2.5 py-1 text-xs font-medium text-white hover:bg-neutral-700 disabled:opacity-50 dark:bg-neutral-100 dark:text-neutral-900 dark:hover:bg-neutral-300">
+          {launching ? 'Opening terminal…' : 'Sign in with Claude'}
+        </button>
+        <span className="text-xs text-neutral-500 dark:text-neutral-400">
+          Opens a terminal running <code>claude login</code>.
+        </span>
+      </div>
+      {launchError && (
+        <p className="text-xs text-rose-600 dark:text-rose-400">{launchError}</p>
+      )}
       <p className="text-xs text-neutral-500 dark:text-neutral-400">
-        Run <code>claude login</code> in your terminal to sign in with your Claude Pro/Max
-        subscription, then click Recheck. Or set <code>ANTHROPIC_API_KEY</code> to use an API key.
+        After completing login, click <strong>Recheck</strong> above. Alternatively set{' '}
+        <code>ANTHROPIC_API_KEY</code> to use an API key.
       </p>
     </div>
   );

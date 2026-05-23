@@ -5,6 +5,7 @@ mod cdp;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod cef_preflight;
 mod cef_profile;
+mod claude_code;
 mod companion_commands;
 mod core_process;
 mod core_rpc;
@@ -3059,7 +3060,8 @@ pub fn run() {
             companion_commands::unregister_companion_hotkey,
             companion_commands::companion_activate,
             mcp_commands::mcp_resolve_binary_path,
-            mcp_commands::mcp_open_client_config
+            mcp_commands::mcp_open_client_config,
+            claude_code::claude_code_login_launch
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
