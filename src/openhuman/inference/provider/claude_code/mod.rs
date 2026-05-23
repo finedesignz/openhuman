@@ -9,6 +9,7 @@
 //! during a non-interactive `-p` turn).
 
 pub mod auth;
+pub mod auth_status;
 pub mod driver;
 pub mod event_mapper;
 pub mod input_builder;

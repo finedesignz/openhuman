@@ -150,6 +150,7 @@ pub fn all_controller_schemas() -> Vec<ControllerSchema> {
         schemas("should_react"),
         schemas("analyze_sentiment"),
         schemas("claude_code_status"),
+        schemas("claude_code_auth_status"),
     ]
 }
 
@@ -238,6 +239,10 @@ pub fn all_registered_controllers() -> Vec<RegisteredController> {
         RegisteredController {
             schema: schemas("claude_code_status"),
             handler: handle_inference_claude_code_status,
+        },
+        RegisteredController {
+            schema: schemas("claude_code_auth_status"),
+            handler: handle_inference_claude_code_auth_status,
         },
     ]
 }
@@ -464,6 +469,16 @@ pub fn schemas(function: &str) -> ControllerSchema {
             outputs: vec![json_output(
                 "status",
                 "CliStatus payload: ok | not_installed | outdated | unusable, with version + path when present.",
+            )],
+        },
+        "claude_code_auth_status" => ControllerSchema {
+            namespace: "inference",
+            function: "claude_code_auth_status",
+            description: "Detect Claude Code CLI auth state (Pro/Max subscription via credentials.json, API key env, or none). No CLI spawn, no token round-trip.",
+            inputs: vec![],
+            outputs: vec![json_output(
+                "auth",
+                "AuthStatus payload: source = subscription | api_key_env | none, plus optional account_email + expires_at + last_checked.",
             )],
         },
         other => panic!("unknown inference schema: {other}"),
@@ -833,6 +848,17 @@ fn handle_inference_claude_code_status(_params: Map<String, Value>) -> Controlle
         .await
         .map_err(|e| format!("claude_code_status join error: {e}"))?;
         to_json(RpcOutcome::new(status, vec![]))
+    })
+}
+
+fn handle_inference_claude_code_auth_status(_params: Map<String, Value>) -> ControllerFuture {
+    Box::pin(async move {
+        let auth = tokio::task::spawn_blocking(
+            crate::openhuman::inference::provider::claude_code::auth_status::probe,
+        )
+        .await
+        .map_err(|e| format!("claude_code_auth_status join error: {e}"))?;
+        to_json(RpcOutcome::new(auth, vec![]))
     })
 }
 

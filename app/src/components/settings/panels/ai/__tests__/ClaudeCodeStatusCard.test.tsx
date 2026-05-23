@@ -5,14 +5,19 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { ClaudeCodeStatusCard } from '../ClaudeCodeStatusCard';
 
 const probe = vi.fn();
+const authProbe = vi.fn();
 
 vi.mock('../../../../../utils/tauriCommands/config', () => ({
   openhumanClaudeCodeStatus: () => probe(),
+  openhumanClaudeCodeAuthStatus: () => authProbe(),
 }));
 
 describe('ClaudeCodeStatusCard', () => {
   beforeEach(() => {
     probe.mockReset();
+    authProbe.mockReset();
+    // Default auth response — individual tests override as needed.
+    authProbe.mockResolvedValue({ result: { source: 'none', last_checked: 0 } });
   });
 
   it('renders the installed version + path when CC is OK', async () => {
@@ -71,5 +76,72 @@ describe('ClaudeCodeStatusCard', () => {
       expect(screen.getByText(/Installed \(2\.0\.4\)/)).toBeInTheDocument();
     });
     expect(probe).toHaveBeenCalledTimes(2);
+  });
+
+  it('shows subscription auth with account email', async () => {
+    probe.mockResolvedValueOnce({
+      result: { status: 'ok', version: '2.0.4', path: '/usr/local/bin/claude' },
+    });
+    authProbe.mockReset();
+    authProbe.mockResolvedValueOnce({
+      result: {
+        source: 'subscription',
+        account_email: 'jamie@example.com',
+        expires_at: '2026-06-01T00:00:00Z',
+        last_checked: 1700000000,
+      },
+    });
+    render(<ClaudeCodeStatusCard />);
+    await waitFor(() => {
+      expect(screen.getByText(/jamie@example\.com/)).toBeInTheDocument();
+    });
+    expect(screen.getByText(/claude logout/)).toBeInTheDocument();
+  });
+
+  it('shows API key env auth state', async () => {
+    probe.mockResolvedValueOnce({ result: { status: 'not_installed' } });
+    authProbe.mockReset();
+    authProbe.mockResolvedValueOnce({ result: { source: 'api_key_env', last_checked: 0 } });
+    render(<ClaudeCodeStatusCard />);
+    await waitFor(() => {
+      expect(screen.getByText(/detected in environment/i)).toBeInTheDocument();
+    });
+  });
+
+  it('shows not-signed-in with claude login hint', async () => {
+    probe.mockResolvedValueOnce({ result: { status: 'not_installed' } });
+    render(<ClaudeCodeStatusCard />);
+    await waitFor(() => {
+      expect(screen.getByText(/Not signed in\./)).toBeInTheDocument();
+    });
+    expect(screen.getByText(/claude login/)).toBeInTheDocument();
+  });
+
+  it('Recheck triggers a second auth probe without re-running version probe', async () => {
+    probe.mockResolvedValueOnce({
+      result: { status: 'ok', version: '2.0.4', path: '/x/y/claude' },
+    });
+    authProbe.mockReset();
+    authProbe
+      .mockResolvedValueOnce({ result: { source: 'none', last_checked: 0 } })
+      .mockResolvedValueOnce({
+        result: {
+          source: 'subscription',
+          account_email: 'user@example.com',
+          expires_at: null,
+          last_checked: 1,
+        },
+      });
+    const user = userEvent.setup();
+    render(<ClaudeCodeStatusCard />);
+    await waitFor(() => {
+      expect(screen.getByText(/Not signed in\./)).toBeInTheDocument();
+    });
+    await user.click(screen.getByRole('button', { name: /Recheck/i }));
+    await waitFor(() => {
+      expect(screen.getByText(/user@example\.com/)).toBeInTheDocument();
+    });
+    expect(probe).toHaveBeenCalledTimes(1);
+    expect(authProbe).toHaveBeenCalledTimes(2);
   });
 });

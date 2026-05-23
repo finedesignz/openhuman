@@ -10,7 +10,7 @@ Reference implementation: `C:\Users\artic\GitHub\opencode` — `packages/opencod
 
 ## 2. Non-goals (v1)
 
-- Subscription/OAuth auth (Claude Pro/Max) — defer to v2. v1 uses `ANTHROPIC_API_KEY` and any pre-existing `~/.claude/.credentials.json`.
+- Subscription/OAuth auth (Claude Pro/Max) — v1 passes through `~/.claude/.credentials.json` if the user has run `claude login` (CLI handles refresh). v1.1 adds **detection + UI** (auth_status RPC + settings card surfacing). In-app OAuth flow still deferred to v2.
 - Exposing **write** tools (memory mutation, channel send, etc.) via MCP — defer to v1.1 after threat model.
 - Co-enabling CC's built-in tools (`Bash`/`Read`/`Edit`) — disabled in v1 via `--disallowedTools`.
 - Cost accounting wired into `cost.rs` — defer to v1.1.
@@ -222,3 +222,4 @@ API key set per-process via env var on spawn (`Command::env`), not as CLI arg (w
 2. **Read-only MCP tool subset (v1)**: `memory_search`, `memory_get`, `threads_list`, `threads_get`, `threads_messages`, `channels_list`, `channels_messages_read`, `people_search`, `people_get`, `webhooks_list`. Exposed as `mcp__openhuman__<name>`. Write tools deferred to v1.1.
 3. **Per-role provider selection**: CC selectable independently for `chat`, `agentic`, `reasoning` roles via factory string grammar. No single global toggle.
 4. **UI branding**: "Claude Code CLI" in all settings copy, provider picker labels, and status panel headings.
+5. **Subscription detection (v1.1)**: Separate `openhuman.claude_code_auth_status` RPC (pure FS, no CLI spawn). Reads `~/.claude/.credentials.json` tolerantly — returns `subscription | api_key_env | none` with optional `account_email` + `expires_at`. Token never round-trips through RPC. Sign-out delegated to `claude logout` (no in-app file deletion to avoid half-state).

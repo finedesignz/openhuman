@@ -1,22 +1,30 @@
 import { useCallback, useEffect, useState } from 'react';
 
 import {
+  type ClaudeCodeAuthStatus,
   type ClaudeCodeStatus,
+  openhumanClaudeCodeAuthStatus,
   openhumanClaudeCodeStatus,
 } from '../../../../utils/tauriCommands/config';
 
 /**
  * Status card for the Claude Code CLI provider.
  *
- * Probes the local `claude` binary on mount (and on a manual Refresh) and
- * surfaces install / version state to the user. Read-only — does not write
- * any settings. Embed inside the AI settings panel above the routing
- * dropdowns once per-role selection wiring lands.
+ * Surfaces two independent probes:
+ *   1. Binary install + version (slow — spawns `claude --version`).
+ *   2. Auth state — Pro/Max subscription via `~/.claude/.credentials.json`
+ *      or `ANTHROPIC_API_KEY` env (fast — pure FS).
+ *
+ * Each refreshes independently so a user who just ran `claude login` can
+ * re-probe auth without re-spawning the binary.
  */
 export function ClaudeCodeStatusCard() {
   const [status, setStatus] = useState<ClaudeCodeStatus | null>(null);
+  const [auth, setAuth] = useState<ClaudeCodeAuthStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [authError, setAuthError] = useState<string | null>(null);
   const [loading, setLoading] = useState<boolean>(false);
+  const [authLoading, setAuthLoading] = useState<boolean>(false);
 
   const probe = useCallback(async () => {
     setLoading(true);
@@ -32,9 +40,24 @@ export function ClaudeCodeStatusCard() {
     }
   }, []);
 
+  const probeAuth = useCallback(async () => {
+    setAuthLoading(true);
+    setAuthError(null);
+    try {
+      const resp = await openhumanClaudeCodeAuthStatus();
+      setAuth(resp.result);
+    } catch (err) {
+      setAuthError(err instanceof Error ? err.message : String(err));
+      setAuth(null);
+    } finally {
+      setAuthLoading(false);
+    }
+  }, []);
+
   useEffect(() => {
     void probe();
-  }, [probe]);
+    void probeAuth();
+  }, [probe, probeAuth]);
 
   return (
     <section
@@ -55,6 +78,25 @@ export function ClaudeCodeStatusCard() {
         </button>
       </header>
       <StatusBody status={status} error={error} />
+
+      <div className="mt-4 border-t border-neutral-200 pt-3 dark:border-neutral-800">
+        <header className="mb-2 flex items-center justify-between">
+          <h4 className="text-xs font-semibold uppercase tracking-wide text-neutral-500 dark:text-neutral-400">
+            Authentication
+          </h4>
+          <button
+            type="button"
+            onClick={() => {
+              void probeAuth();
+            }}
+            disabled={authLoading}
+            className="text-xs text-neutral-500 hover:text-neutral-900 disabled:opacity-50 dark:text-neutral-400 dark:hover:text-neutral-100">
+            {authLoading ? 'Checking…' : 'Recheck'}
+          </button>
+        </header>
+        <AuthBody auth={auth} error={authError} />
+      </div>
+
       <p className="mt-3 text-xs text-neutral-500 dark:text-neutral-400">
         Use the <code>claude-code:&lt;model&gt;</code> provider string to route chat, agentic, or
         reasoning workloads through your local Claude Code CLI install.
@@ -116,4 +158,52 @@ function StatusBody({ status, error }: { status: ClaudeCodeStatus | null; error:
         </dl>
       );
   }
+}
+
+function AuthBody({ auth, error }: { auth: ClaudeCodeAuthStatus | null; error: string | null }) {
+  if (error) {
+    return <p className="text-xs text-rose-600 dark:text-rose-400">Failed to check: {error}</p>;
+  }
+  if (!auth) {
+    return <p className="text-xs text-neutral-500 dark:text-neutral-400">Checking…</p>;
+  }
+  if (auth.source === 'subscription') {
+    return (
+      <div className="space-y-1">
+        <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-xs">
+          <dt className="text-neutral-500">Signed in</dt>
+          <dd className="text-emerald-600 dark:text-emerald-400">
+            {auth.account_email ?? 'Claude subscription'}
+          </dd>
+          {auth.expires_at && (
+            <>
+              <dt className="text-neutral-500">Token expires</dt>
+              <dd className="font-mono text-neutral-700 dark:text-neutral-300">
+                {auth.expires_at}
+              </dd>
+            </>
+          )}
+        </dl>
+        <p className="text-xs text-neutral-500 dark:text-neutral-400">
+          To sign out, run <code>claude logout</code> in your terminal, then click Recheck.
+        </p>
+      </div>
+    );
+  }
+  if (auth.source === 'api_key_env') {
+    return (
+      <p className="text-xs text-emerald-600 dark:text-emerald-400">
+        <code>ANTHROPIC_API_KEY</code> detected in environment.
+      </p>
+    );
+  }
+  return (
+    <div className="space-y-1">
+      <p className="text-xs text-amber-600 dark:text-amber-400">Not signed in.</p>
+      <p className="text-xs text-neutral-500 dark:text-neutral-400">
+        Run <code>claude login</code> in your terminal to sign in with your Claude Pro/Max
+        subscription, then click Recheck. Or set <code>ANTHROPIC_API_KEY</code> to use an API key.
+      </p>
+    </div>
+  );
 }
