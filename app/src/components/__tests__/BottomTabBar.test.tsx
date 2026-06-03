@@ -7,7 +7,7 @@
  * [#1123] Covers the walkthroughAttr object added for the Joyride walkthrough.
  */
 import { configureStore } from '@reduxjs/toolkit';
-import { render, screen } from '@testing-library/react';
+import { fireEvent, render, screen } from '@testing-library/react';
 import { Provider } from 'react-redux';
 import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -27,6 +27,7 @@ vi.mock('../../utils/config', async importOriginal => {
 });
 
 vi.mock('../../utils/accountsFullscreen', () => ({ isAccountsFullscreen: vi.fn(() => false) }));
+vi.mock('../../services/analytics', () => ({ trackEvent: vi.fn() }));
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -54,22 +55,30 @@ function buildStore(opts: BuildStoreOpts = {}) {
 interface RenderOpts {
   hasToken?: boolean;
   companionSessionActive?: boolean;
+  tokenValue?: string;
 }
 
 async function renderBottomTabBar(pathname = '/home', opts: RenderOpts | boolean = {}) {
   // Back-compat: previous callsites passed `hasToken` as the 2nd positional arg.
   const resolved: RenderOpts = typeof opts === 'boolean' ? { hasToken: opts } : opts;
   const hasToken = resolved.hasToken ?? true;
+  const tokenValue = resolved.tokenValue ?? 'tok-test';
   const { useCoreState } = await import('../../providers/CoreStateProvider');
   vi.mocked(useCoreState).mockReturnValue({
     snapshot: {
-      sessionToken: hasToken ? 'tok-test' : null,
+      sessionToken: hasToken ? tokenValue : null,
       auth: { isAuthenticated: true, userId: 'u1', user: null, profileId: null },
       currentUser: null,
       onboardingCompleted: true,
       chatOnboardingCompleted: true,
       analyticsEnabled: false,
-      localState: { encryptionKey: null, onboardingTasks: null },
+      localState: { encryptionKey: null, onboardingTasks: null, keyringConsent: null },
+      keyringStatus: {
+        available: true,
+        failureReason: null,
+        activeMode: 'os_keyring',
+        backendName: 'os',
+      },
       runtime: { screenIntelligence: null, localAi: null, autocomplete: null, service: null },
     },
     isBootstrapping: false,
@@ -123,6 +132,11 @@ describe('BottomTabBar', () => {
     expect(container.firstChild).toBeNull();
   });
 
+  it('still shows the Rewards tab for local sessions', async () => {
+    await renderBottomTabBar('/home', { tokenValue: 'header.payload.local' });
+    expect(screen.getByRole('button', { name: 'Rewards' })).toBeInTheDocument();
+  });
+
   it('renders the pulsing companion dot on the Settings tab when a session is active', async () => {
     const { container } = await renderBottomTabBar('/home', { companionSessionActive: true });
     const settingsBtn = screen.getByRole('button', { name: 'Settings' });
@@ -144,5 +158,28 @@ describe('BottomTabBar', () => {
     const shell = container.firstElementChild;
     expect(shell).toHaveClass('pointer-events-none');
     expect(shell?.querySelector('nav')).toHaveClass('pointer-events-auto');
+  });
+
+  it('tracks tab changes when a different tab is clicked', async () => {
+    const { trackEvent } = await import('../../services/analytics');
+    await renderBottomTabBar('/home');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Chat' }));
+
+    expect(trackEvent).toHaveBeenCalledWith('tab_bar_change', {
+      from_tab: 'home',
+      to_tab: 'chat',
+      from_path: '/home',
+      to_path: '/chat',
+    });
+  });
+
+  it('does not track when the active tab is clicked again', async () => {
+    const { trackEvent } = await import('../../services/analytics');
+    await renderBottomTabBar('/home');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Home' }));
+
+    expect(trackEvent).not.toHaveBeenCalled();
   });
 });

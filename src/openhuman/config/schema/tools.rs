@@ -48,6 +48,114 @@ impl Default for MultimodalConfig {
     }
 }
 
+/// File-attachment counterpart to [`MultimodalConfig`]. Governs how
+/// `[FILE:…]` markers in user messages are resolved, validated, and
+/// inlined as text context for the agent.
+///
+/// Defaults err on the side of "useful for prose docs without blowing
+/// the context window": 4 files per turn, 16 MB per file, 50 000 chars
+/// of extracted text per file. Remote fetch is opt-in.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct MultimodalFileConfig {
+    #[serde(default = "default_multimodal_max_files")]
+    pub max_files: usize,
+    #[serde(default = "default_multimodal_max_file_size_mb")]
+    pub max_file_size_mb: usize,
+    #[serde(default = "default_multimodal_max_extracted_text_chars")]
+    pub max_extracted_text_chars: usize,
+    #[serde(default)]
+    pub allow_remote_fetch: bool,
+    #[serde(default = "default_multimodal_allowed_file_mime_types")]
+    pub allowed_mime_types: Vec<String>,
+}
+
+fn default_multimodal_max_files() -> usize {
+    4
+}
+
+fn default_multimodal_max_file_size_mb() -> usize {
+    16
+}
+
+fn default_multimodal_max_extracted_text_chars() -> usize {
+    50_000
+}
+
+fn default_multimodal_allowed_file_mime_types() -> Vec<String> {
+    vec![
+        // Extractable text formats.
+        "application/pdf".to_string(),
+        "text/plain".to_string(),
+        "text/csv".to_string(),
+        "text/markdown".to_string(),
+        // Binary-only formats surfaced as metadata-only references.
+        "application/zip".to_string(),
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet".to_string(),
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document".to_string(),
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation".to_string(),
+        "application/octet-stream".to_string(),
+    ]
+}
+
+impl MultimodalFileConfig {
+    /// Clamp configured values to safe runtime bounds.
+    pub fn effective_limits(&self) -> (usize, usize, usize) {
+        let max_files = self.max_files.clamp(1, 16);
+        let max_file_size_mb = self.max_file_size_mb.clamp(1, 50);
+        let max_extracted_text_chars = self.max_extracted_text_chars.clamp(1_000, 200_000);
+        (max_files, max_file_size_mb, max_extracted_text_chars)
+    }
+
+    /// True iff `mime` is on the configured allowlist (case-insensitive).
+    pub fn is_mime_allowed(&self, mime: &str) -> bool {
+        let needle = mime.to_ascii_lowercase();
+        self.allowed_mime_types
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(&needle))
+    }
+
+    /// Hardened config for turns whose user text originates from an
+    /// untrusted third-party channel (Slack / Discord / Telegram /
+    /// WhatsApp / etc.). Disables `[FILE:…]` marker resolution outright
+    /// so a remote sender cannot smuggle `[FILE:/etc/passwd]`,
+    /// `[FILE:.env]`, or any other local-path marker into an inbound
+    /// message and have the agent exfiltrate the file's contents into
+    /// an LLM call. Also forbids remote fetch.
+    ///
+    /// `max_files: 0` is a sentinel: `prepare_messages_for_provider`
+    /// short-circuits at the first `[FILE:…]` marker with
+    /// `TooManyFiles` before any disk or network read happens. This
+    /// holds regardless of the per-operator
+    /// `[tools.multimodal_files]` block in `config.toml`.
+    ///
+    /// Mirrors the triage-arm hardening in
+    /// `openhuman::agent::triage::evaluator`. Apply at the per-turn
+    /// application site (the channel-runtime dispatcher) — the
+    /// operator-supplied `config.multimodal_files` stays the source of
+    /// truth for the desktop / web-chat path where the user owns the
+    /// local filesystem.
+    pub fn for_untrusted_channel_input() -> Self {
+        Self {
+            max_files: 0,
+            allow_remote_fetch: false,
+            ..Default::default()
+        }
+    }
+}
+
+impl Default for MultimodalFileConfig {
+    fn default() -> Self {
+        Self {
+            max_files: default_multimodal_max_files(),
+            max_file_size_mb: default_multimodal_max_file_size_mb(),
+            max_extracted_text_chars: default_multimodal_max_extracted_text_chars(),
+            allow_remote_fetch: false,
+            allowed_mime_types: default_multimodal_allowed_file_mime_types(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct BrowserComputerUseConfig {
@@ -91,6 +199,11 @@ impl Default for BrowserComputerUseConfig {
 pub struct BrowserConfig {
     #[serde(default)]
     pub enabled: bool,
+    /// DEPRECATED: the browser tool now shares the unified web-access host list
+    /// in `[http_request].allowed_domains` (see `tools::ops::all_tools_with_runtime`).
+    /// Still parsed for backward compatibility but no longer gates browser
+    /// navigation. Manage allowed hosts via Settings → Search → Allowed websites;
+    /// browser allow-all remains gated by `OPENHUMAN_BROWSER_ALLOW_ALL`.
     #[serde(default)]
     pub allowed_domains: Vec<String>,
     #[serde(default)]
@@ -134,15 +247,34 @@ impl Default for BrowserConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct HttpRequestConfig {
-    #[serde(default)]
+    /// Hosts the assistant may open/read via `web_fetch` / `curl`. An exact
+    /// host also matches its subdomains; `"*"` allows all public sites; an
+    /// empty list blocks all web access. Defaults to `["*"]` so web research
+    /// works out of the box — the SSRF guard still blocks local/private hosts
+    /// regardless. Narrow this via Settings → Search → Allowed websites.
+    #[serde(default = "default_http_allowed_domains")]
     pub allowed_domains: Vec<String>,
     #[serde(default = "default_http_max_response_size")]
     pub max_response_size: usize,
     #[serde(default = "default_http_timeout_secs")]
     pub timeout_secs: u64,
+}
+
+impl Default for HttpRequestConfig {
+    fn default() -> Self {
+        Self {
+            allowed_domains: default_http_allowed_domains(),
+            max_response_size: default_http_max_response_size(),
+            timeout_secs: default_http_timeout_secs(),
+        }
+    }
+}
+
+fn default_http_allowed_domains() -> Vec<String> {
+    vec!["*".to_string()]
 }
 
 fn default_http_max_response_size() -> usize {
@@ -364,6 +496,11 @@ pub struct McpClientConfig {
     /// Identity block sent during initialize.
     #[serde(default)]
     pub client_identity: McpClientIdentityConfig,
+    /// Optional auth/overrides for the MCP *registry* browse APIs (Smithery +
+    /// the official modelcontextprotocol/registry). Each value falls back to
+    /// the corresponding env var when unset (issue #3039 gap A6).
+    #[serde(default)]
+    pub registry_auth: McpRegistryAuthConfig,
 }
 
 impl Default for McpClientConfig {
@@ -372,8 +509,33 @@ impl Default for McpClientConfig {
             enabled: defaults::default_true(),
             servers: Vec::new(),
             client_identity: McpClientIdentityConfig::default(),
+            registry_auth: McpRegistryAuthConfig::default(),
         }
     }
+}
+
+/// Registry-browse auth + endpoint overrides. Lets a user who hits Smithery
+/// rate limits (or needs an authenticated official-registry endpoint) supply
+/// credentials from the desktop app instead of editing env vars. Each field is
+/// config-first with an env-var fallback so existing CI/Docker deployments that
+/// only set env vars keep working unchanged.
+///
+/// Secrets are write-only over RPC: the getter reports whether each secret is
+/// *set* (a boolean) and never echoes the value back.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct McpRegistryAuthConfig {
+    /// Smithery API key. Falls back to `SMITHERY_API_KEY`.
+    #[serde(default)]
+    pub smithery_api_key: Option<String>,
+    /// Base URL override for the official registry. Falls back to
+    /// `MCP_OFFICIAL_REGISTRY_BASE` (non-secret).
+    #[serde(default)]
+    pub mcp_official_base: Option<String>,
+    /// Bearer token for the official registry. Falls back to
+    /// `MCP_OFFICIAL_REGISTRY_TOKEN`.
+    #[serde(default)]
+    pub mcp_official_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -491,6 +653,223 @@ impl Default for WebSearchConfig {
     }
 }
 
+// ── Search engines ──────────────────────────────────────────────────
+//
+// Unified search-engine selector. Only one engine is active at a time
+// (mirrors the LLM-provider API-key flow). The active engine governs
+// which tools are registered: `disabled` → no search tools; `managed` →
+// backend-proxied `web_search`; `parallel` → direct Parallel API tools
+// (search/extract/chat/research/enrich/dataset); `brave` → direct Brave Search
+// tools (web/news/images/videos); `querit` → direct Querit web search.
+
+pub const SEARCH_ENGINE_DISABLED: &str = "disabled";
+pub const SEARCH_ENGINE_MANAGED: &str = "managed";
+pub const SEARCH_ENGINE_PARALLEL: &str = "parallel";
+pub const SEARCH_ENGINE_BRAVE: &str = "brave";
+pub const SEARCH_ENGINE_QUERIT: &str = "querit";
+
+fn default_search_engine() -> String {
+    SEARCH_ENGINE_MANAGED.into()
+}
+
+fn default_search_max_results() -> usize {
+    5
+}
+
+fn default_search_timeout_secs() -> u64 {
+    15
+}
+
+/// Credentials for a BYO search engine. Mirrors the LLM provider API-
+/// key shape — a simple `Option<String>` that is considered configured
+/// iff the trimmed value is non-empty.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct SearchEngineCredentials {
+    #[serde(default)]
+    pub api_key: Option<String>,
+}
+
+impl SearchEngineCredentials {
+    pub fn has_key(&self) -> bool {
+        self.api_key
+            .as_deref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false)
+    }
+
+    pub fn key(&self) -> Option<&str> {
+        self.api_key.as_deref().and_then(|s| {
+            let t = s.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t)
+            }
+        })
+    }
+}
+
+/// Unified search-engine configuration. Exactly one engine drives tool
+/// registration at a time. `disabled` suppresses all search tools; `managed` is
+/// the backend-proxied default and requires no key; `parallel`, `brave`, and
+/// `querit` are BYO and require their own API key in the matching sub-block.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct SearchConfig {
+    /// Active search engine. One of [`SEARCH_ENGINE_DISABLED`],
+    /// [`SEARCH_ENGINE_MANAGED`], [`SEARCH_ENGINE_PARALLEL`],
+    /// [`SEARCH_ENGINE_BRAVE`], or [`SEARCH_ENGINE_QUERIT`]. Unknown values
+    /// fall back to managed at registration time.
+    #[serde(default = "default_search_engine")]
+    pub engine: String,
+
+    /// Max results per query (1–20, default 5).
+    #[serde(default = "default_search_max_results")]
+    pub max_results: usize,
+
+    /// Per-request timeout in seconds (default 15).
+    #[serde(default = "default_search_timeout_secs")]
+    pub timeout_secs: u64,
+
+    /// Parallel API credentials (used when `engine = "parallel"`).
+    #[serde(default)]
+    pub parallel: SearchEngineCredentials,
+
+    /// Brave Search credentials (used when `engine = "brave"`).
+    #[serde(default)]
+    pub brave: SearchEngineCredentials,
+
+    /// Querit credentials (used when `engine = "querit"`).
+    #[serde(default)]
+    pub querit: SearchEngineCredentials,
+}
+
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self {
+            engine: default_search_engine(),
+            max_results: default_search_max_results(),
+            timeout_secs: default_search_timeout_secs(),
+            parallel: SearchEngineCredentials::default(),
+            brave: SearchEngineCredentials::default(),
+            querit: SearchEngineCredentials::default(),
+        }
+    }
+}
+
+/// Normalized search-engine enum used at tool-registration time. Falls
+/// back to [`SearchEngine::Managed`] for unknown strings and for BYO
+/// engines that have no API key configured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchEngine {
+    Disabled,
+    Managed,
+    Parallel,
+    Brave,
+    Querit,
+}
+
+impl SearchConfig {
+    /// Resolve the *effective* engine after gating on API-key
+    /// availability. A BYO engine without a key silently falls back to
+    /// managed so the agent never ends up with zero search tools — the
+    /// UI surfaces the misconfiguration separately.
+    pub fn effective_engine(&self) -> SearchEngine {
+        match self.engine.trim().to_ascii_lowercase().as_str() {
+            SEARCH_ENGINE_DISABLED => SearchEngine::Disabled,
+            SEARCH_ENGINE_PARALLEL if self.parallel.has_key() => SearchEngine::Parallel,
+            SEARCH_ENGINE_BRAVE if self.brave.has_key() => SearchEngine::Brave,
+            SEARCH_ENGINE_QUERIT if self.querit.has_key() => SearchEngine::Querit,
+            _ => SearchEngine::Managed,
+        }
+    }
+
+    pub fn requested_engine_str(&self) -> &str {
+        let trimmed = self.engine.trim();
+        if trimmed.is_empty() {
+            SEARCH_ENGINE_MANAGED
+        } else {
+            trimmed
+        }
+    }
+}
+
+#[cfg(test)]
+mod search_config_tests {
+    use super::*;
+
+    #[test]
+    fn defaults_to_managed() {
+        let cfg = SearchConfig::default();
+        assert_eq!(cfg.effective_engine(), SearchEngine::Managed);
+    }
+
+    #[test]
+    fn disabled_stays_disabled() {
+        let cfg = SearchConfig {
+            engine: SEARCH_ENGINE_DISABLED.into(),
+            ..Default::default()
+        };
+        assert_eq!(cfg.effective_engine(), SearchEngine::Disabled);
+    }
+
+    #[test]
+    fn parallel_requires_key() {
+        let mut cfg = SearchConfig {
+            engine: SEARCH_ENGINE_PARALLEL.into(),
+            ..Default::default()
+        };
+        assert_eq!(cfg.effective_engine(), SearchEngine::Managed);
+        cfg.parallel.api_key = Some("  ".into());
+        assert_eq!(cfg.effective_engine(), SearchEngine::Managed);
+        cfg.parallel.api_key = Some("real".into());
+        assert_eq!(cfg.effective_engine(), SearchEngine::Parallel);
+    }
+
+    #[test]
+    fn brave_requires_key() {
+        let mut cfg = SearchConfig {
+            engine: SEARCH_ENGINE_BRAVE.into(),
+            ..Default::default()
+        };
+        assert_eq!(cfg.effective_engine(), SearchEngine::Managed);
+        cfg.brave.api_key = Some("real".into());
+        assert_eq!(cfg.effective_engine(), SearchEngine::Brave);
+    }
+
+    #[test]
+    fn querit_requires_key() {
+        let mut cfg = SearchConfig {
+            engine: SEARCH_ENGINE_QUERIT.into(),
+            ..Default::default()
+        };
+        assert_eq!(cfg.effective_engine(), SearchEngine::Managed);
+        cfg.querit.api_key = Some("real".into());
+        assert_eq!(cfg.effective_engine(), SearchEngine::Querit);
+    }
+
+    #[test]
+    fn http_request_defaults_to_allow_all() {
+        // Web research works out of the box: the default allowlist is the
+        // wildcard. The SSRF guard (url_guard) still blocks local/private
+        // hosts regardless, so this only opens public sites.
+        let cfg = HttpRequestConfig::default();
+        assert_eq!(cfg.allowed_domains, vec!["*".to_string()]);
+        assert_eq!(cfg.max_response_size, 1_000_000);
+        assert_eq!(cfg.timeout_secs, 30);
+    }
+
+    #[test]
+    fn unknown_engine_falls_back_to_managed() {
+        let cfg = SearchConfig {
+            engine: "duckduckgo".into(),
+            ..Default::default()
+        };
+        assert_eq!(cfg.effective_engine(), SearchEngine::Managed);
+    }
+}
+
 /// Composio integration routing mode for the main backend-proxied flow.
 ///
 /// `"backend"` (default) — every Composio call (toolkits, connections,
@@ -505,7 +884,7 @@ impl Default for WebSearchConfig {
 /// (the async push surface that the backend currently mediates via
 /// socket.io) do not work in direct mode — the user has to enable them
 /// out-of-band on Composio's dashboard and configure their own webhook
-/// sink. See `tools/impl/network/composio.rs` for the underlying client.
+/// sink. See `composio/tools/direct.rs` for the underlying client.
 pub const COMPOSIO_MODE_BACKEND: &str = "backend";
 pub const COMPOSIO_MODE_DIRECT: &str = "direct";
 
@@ -593,6 +972,12 @@ pub struct ComputerControlConfig {
     /// the user must explicitly opt in.
     #[serde(default)]
     pub enabled: bool,
+    /// Opt-in for the mutating `ax_interact` actions (`press` / `set_value`).
+    /// Disabled by default: the read-only `list` action is always available,
+    /// but actuating arbitrary app controls / typing into arbitrary fields
+    /// requires explicit user opt-in (mirrors `enabled` for mouse/keyboard).
+    #[serde(default)]
+    pub ax_interact_mutations: bool,
 }
 
 // ── Agent integration tools (backend-proxied) ───────────────────────

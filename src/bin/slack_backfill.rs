@@ -211,8 +211,8 @@ async fn main() -> Result<()> {
 
     if cli.seal_probe {
         use chrono::{Duration, Utc};
-        use openhuman_core::openhuman::memory::tree::canonicalize::chat::{ChatBatch, ChatMessage};
-        use openhuman_core::openhuman::memory::tree::ingest::ingest_chat;
+        use openhuman_core::openhuman::memory::ingest_pipeline::ingest_chat;
+        use openhuman_core::openhuman::memory_sync::canonicalize::chat::{ChatBatch, ChatMessage};
 
         let connection_id = cli.connection_id.clone().ok_or_else(|| {
             anyhow::anyhow!(
@@ -450,6 +450,7 @@ async fn main() -> Result<()> {
                 config: Arc::clone(&config),
                 toolkit: conn.toolkit.clone(),
                 connection_id: Some(conn.id.clone()),
+                usage: Default::default(),
             };
             match run_backfill_via_search(&ctx, cli.days).await {
                 Ok(outcome) => {
@@ -547,6 +548,7 @@ async fn main() -> Result<()> {
             config: Arc::clone(&config),
             toolkit: conn.toolkit.clone(),
             connection_id: Some(conn.id.clone()),
+            usage: Default::default(),
         };
         match provider.sync(&ctx, SyncReason::Manual).await {
             Ok(outcome) => {

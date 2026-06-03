@@ -30,6 +30,9 @@
     },
     "updater:default",
     "allow-core-process",
-    "allow-app-update"
+    "allow-workspace-files",
+    "allow-artifact-download",
+    "allow-app-update",
+    "allow-loopback-oauth"
   ]
 }

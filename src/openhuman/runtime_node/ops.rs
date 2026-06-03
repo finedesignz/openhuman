@@ -38,6 +38,7 @@ fn build_runtime_tools(config: &Config) -> Result<Vec<Box<dyn Tool>>, String> {
     let security = Arc::new(SecurityPolicy::from_config(
         &config.autonomy,
         &config.workspace_dir,
+        &config.action_dir,
     ));
     // Phase 1 of #1401: see comment in channels/runtime/startup.rs.
     let audit = crate::openhuman::security::get_or_create_workspace_audit_logger(
@@ -49,7 +50,7 @@ fn build_runtime_tools(config: &Config) -> Result<Vec<Box<dyn Tool>>, String> {
     let local_embedding = config.workload_local_model("embeddings");
     trace!("[runtime_node::ops] build_runtime_tools: create_memory_with_local_ai");
     let memory: Arc<dyn Memory> = Arc::from(
-        crate::openhuman::memory::create_memory_with_local_ai(
+        crate::openhuman::memory_store::create_memory_with_local_ai(
             &config.memory,
             local_embedding.as_deref(),
             &config.embedding_routes,
@@ -73,7 +74,7 @@ fn build_runtime_tools(config: &Config) -> Result<Vec<Box<dyn Tool>>, String> {
         memory,
         &config.browser,
         &config.http_request,
-        &config.workspace_dir,
+        &config.action_dir,
         &config.agents,
         config,
     );

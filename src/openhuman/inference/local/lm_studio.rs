@@ -187,6 +187,53 @@ pub(crate) struct LmStudioChatChoice {
 pub(crate) struct LmStudioChatResponseMessage {
     #[serde(default)]
     pub content: Option<String>,
+    /// Local reasoning models expose chain-of-thought as `reasoning_content`
+    /// or `reasoning` depending on the runtime — accept both field names.
+    #[serde(default, alias = "reasoning")]
+    pub reasoning_content: Option<String>,
+}
+
+impl LmStudioChatResponseMessage {
+    pub(crate) fn effective_content(&self) -> String {
+        let content = self
+            .content
+            .as_deref()
+            .map(crate::openhuman::inference::provider::compatible_parse::strip_think_tags)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_default();
+        if !content.is_empty() {
+            tracing::trace!(
+                source = "content",
+                output_chars = content.chars().count(),
+                "[lm-studio] effective content selected"
+            );
+            return content;
+        }
+
+        let reasoning = self
+            .reasoning_content
+            .as_deref()
+            .map(crate::openhuman::inference::provider::compatible_parse::strip_think_tags)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_default();
+        if !reasoning.is_empty() {
+            tracing::trace!(
+                source = "reasoning_content",
+                output_chars = reasoning.chars().count(),
+                "[lm-studio] effective content selected"
+            );
+            return reasoning;
+        }
+
+        tracing::trace!(
+            source = "none",
+            output_chars = 0,
+            "[lm-studio] effective content empty"
+        );
+        String::new()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -227,5 +274,32 @@ mod tests {
             normalize_lm_studio_base_url("http://127.0.0.1:1234/v1/models").as_deref(),
             Some("http://127.0.0.1:1234/v1")
         );
+    }
+
+    #[test]
+    fn effective_content_falls_back_to_reasoning_content() {
+        let msg = LmStudioChatResponseMessage {
+            content: Some("".into()),
+            reasoning_content: Some("thinking text".into()),
+        };
+        assert_eq!(msg.effective_content(), "thinking text");
+    }
+
+    #[test]
+    fn effective_content_strips_think_tags() {
+        let msg = LmStudioChatResponseMessage {
+            content: Some("<think>hidden</think>Visible reply".into()),
+            reasoning_content: None,
+        };
+        assert_eq!(msg.effective_content(), "Visible reply");
+    }
+
+    #[test]
+    fn reasoning_content_accepts_reasoning_alias() {
+        // Local runtimes that name the field `reasoning` must still be captured
+        // (issue #3094) so reasoning round-trips like the canonical field.
+        let msg: LmStudioChatResponseMessage =
+            serde_json::from_str(r#"{"content":null,"reasoning":"local cot"}"#).unwrap();
+        assert_eq!(msg.reasoning_content.as_deref(), Some("local cot"));
     }
 }

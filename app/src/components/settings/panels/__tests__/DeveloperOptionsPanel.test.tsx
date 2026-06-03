@@ -21,9 +21,21 @@ vi.mock('@tauri-apps/api/core', () => ({ invoke: hoisted.invoke, isTauri: hoiste
 vi.mock('../../../../services/analytics', () => ({ triggerSentryTestEvent: hoisted.trigger }));
 
 vi.mock('../../../../utils/config', () => ({
+  APP_BINARY_VERSION: '0.0.0-test',
   get APP_ENVIRONMENT() {
     return hoisted.appEnvironment;
   },
+  APP_VERSION: '0.0.0-test',
+  BUILD_SHA: 'test',
+  CORE_CARGO_VERSION: '0.0.0-test',
+  GA_MEASUREMENT_ID: undefined,
+  IS_DEV: true,
+  OPENPANEL_API_URL: 'https://panel.tinyhumans.ai/api',
+  OPENPANEL_CLIENT_ID: undefined,
+  SENTRY_DSN: undefined,
+  SENTRY_RELEASE: 'openhuman@test',
+  SENTRY_SMOKE_TEST: false,
+  TAURI_CARGO_VERSION: '0.0.0-test',
   // Pulled transitively via `resetWalkthrough` → configPersistence.
   CORE_RPC_URL: 'http://127.0.0.1:7788/rpc',
   BACKEND_URL: 'http://localhost:5005',
@@ -113,8 +125,8 @@ describe('DeveloperOptionsPanel — CoreModeBadge', () => {
 
     expect(screen.getByText('AI 配置')).toBeInTheDocument();
     expect(screen.getByText('屏幕感知')).toBeInTheDocument();
-    expect(screen.getByText('消息渠道')).toBeInTheDocument();
-    expect(screen.getByText('配置 Telegram/Discord 认证模式和默认渠道路由')).toBeInTheDocument();
+    // The messaging tile was removed; composio replaced it as a single destination.
+    expect(screen.getByText('Composio')).toBeInTheDocument();
   });
 });
 

@@ -3,21 +3,28 @@
  * the ingestion pipeline manually.
  *
  *   ┌───────────────────────────────────────────────────────┐
- *   │  Memory Sync Connections (counts + freshness pills)   │
+ *   │  MemoryTreeStatusPanel (chunk counts + freshness)     │
  *   └───────────────────────────────────────────────────────┘
  *   ┌───────────────────────────────────────────────────────┐
- *   │  Composio connections  · [Sync] per row               │
+ *   │  MemorySourcesRegistry — unified source list          │
+ *   │  (Composio + folder + GitHub + RSS + web · per-row    │
+ *   │   Sync button, status chip, chunk count, freshness)   │
  *   └───────────────────────────────────────────────────────┘
  *   ┌───────────────────────────────────────────────────────┐
- *   │   [ View vault in Obsidian ]   [ Build summary trees ]│
+ *   │  WhatsAppMemorySection                                │
+ *   └───────────────────────────────────────────────────────┘
+ *   ┌───────────────────────────────────────────────────────┐
+ *   │  ModeToggle · Reset Memory · Reset Tree · Build Trees │
+ *   │  [ View vault in Obsidian ]  (shown when vault set)   │
  *   └───────────────────────────────────────────────────────┘
  *   ┌───────────────────────────────────────────────────────┐
  *   │           Force-directed summary graph (SVG)          │
  *   └───────────────────────────────────────────────────────┘
  *
- * `Sync` (per provider) calls `composio.sync` which downloads new raw
- * items from the toolkit (Gmail messages, Slack messages, …) and
- * writes them into the memory chunk store.
+ * `MemorySourcesRegistry` replaces the old Composio-only `MemorySources`
+ * panel. It auto-seeds active Composio connections as sources and lets
+ * users add folder, GitHub repo, RSS, and web-page sources via the
+ * Add Source dialog.
  *
  * `Build summary trees` calls `memory_tree.flush_now` which enqueues a
  * `flush_stale` job with `max_age_secs=0` so every L0 buffer
@@ -29,7 +36,6 @@ import { useCallback, useEffect, useState } from 'react';
 
 import { useT } from '../../lib/i18n/I18nContext';
 import type { ToastNotification } from '../../types/intelligence';
-import { openUrl, revealPath } from '../../utils/openUrl';
 import {
   type GraphExportResponse,
   type GraphMode,
@@ -39,53 +45,14 @@ import {
   memoryTreeWipeAll,
 } from '../../utils/tauriCommands';
 import { MemoryGraph } from './MemoryGraph';
-import { MemorySources } from './MemorySources';
-import { VaultPanel } from './VaultPanel';
+import { MemorySourcesRegistry } from './MemorySourcesRegistry';
+import { MemoryTreeStatusPanel } from './MemoryTreeStatusPanel';
+import { ObsidianVaultSection } from './ObsidianVaultSection';
+import { SyncAuditPanel } from './SyncAuditPanel';
 import { WhatsAppMemorySection } from './WhatsAppMemorySection';
 
 interface MemoryWorkspaceProps {
   onToast?: (toast: Omit<ToastNotification, 'id'>) => void;
-}
-
-/**
- * Toolkits that have a memory-tree-ingesting sync implementation on the
- * Rust side. Only these get a Sync button — clicking it on a toolkit
- * that lacks an ingest path would just churn the worker without
- * adding chunks to the memory tree.
- *
- * Source of truth: providers under
- * `src/openhuman/composio/providers/<toolkit>/` that call
- * `ingest_page_into_memory_tree`. Today that's gmail. Add a slug here
- * when a new provider lands a memory-tree ingest path.
- */
-const SYNCABLE_TOOLKITS: ReadonlySet<string> = new Set(['gmail']);
-
-/**
- * Trigger the `obsidian://open?path=<abs>` deep link via the OS shell.
- *
- * We deliberately route through `openUrl` (which delegates to
- * `tauri-plugin-opener`) rather than setting `window.location.href`.
- * The webview-host intent handler intercepts in-app navigations and
- * does NOT punt custom schemes to the OS, so a direct
- * `window.location.href = "obsidian://…"` either no-ops or navigates
- * the React app away from the Memory tab. The opener plugin hands the
- * URL straight to the system handler so Obsidian launches as a
- * separate process.
- *
- * Returns `null` on success, or the underlying error otherwise. The
- * caller decides how to surface the outcome (toast, fallback, …); an
- * unsurfaced no-op is the bug #2281 originally reported.
- */
-async function openVaultInObsidian(contentRootAbs: string): Promise<unknown | null> {
-  const url = `obsidian://open?path=${encodeURIComponent(contentRootAbs)}`;
-  console.debug('[ui-flow][memory-workspace] open vault in Obsidian url=%s', url);
-  try {
-    await openUrl(url);
-    return null;
-  } catch (err) {
-    console.error('[ui-flow][memory-workspace] openUrl failed', err);
-    return err;
-  }
 }
 
 export function MemoryWorkspace({ onToast }: MemoryWorkspaceProps) {
@@ -97,13 +64,13 @@ export function MemoryWorkspace({ onToast }: MemoryWorkspaceProps) {
   const [resetting, setResetting] = useState(false);
   const [mode, setMode] = useState<GraphMode>('tree');
 
-  // (Re)load the graph whenever the mode toggle flips. The Memory
-  // sources panel manages its own polling.
+  const [graphVersion, setGraphVersion] = useState(0);
+
+  // (Re)load the graph whenever the mode toggle flips or tree events arrive.
   useEffect(() => {
-    console.debug('[ui-flow][memory-workspace] graph load: entry mode=%s', mode);
+    console.debug('[ui-flow][memory-workspace] graph load: entry mode=%s v=%d', mode, graphVersion);
     let cancelled = false;
     setError(null);
-    setGraph(null);
     void (async () => {
       try {
         const resp = await memoryTreeGraphExport(mode);
@@ -124,7 +91,25 @@ export function MemoryWorkspace({ onToast }: MemoryWorkspaceProps) {
     return () => {
       cancelled = true;
     };
-  }, [mode]);
+  }, [mode, graphVersion]);
+
+  useEffect(() => {
+    const onTreeDone = () => {
+      setTimeout(() => setGraphVersion(v => v + 1), 2000);
+    };
+    const onSyncDone = (e: Event) => {
+      const data = (e as CustomEvent).detail as { stage?: string } | null;
+      if (data?.stage === 'completed') {
+        setTimeout(() => setGraphVersion(v => v + 1), 3000);
+      }
+    };
+    window.addEventListener('openhuman:memory-tree-completed', onTreeDone);
+    window.addEventListener('openhuman:memory-sync-stage', onSyncDone);
+    return () => {
+      window.removeEventListener('openhuman:memory-tree-completed', onTreeDone);
+      window.removeEventListener('openhuman:memory-sync-stage', onSyncDone);
+    };
+  }, []);
 
   const handleWipe = useCallback(async () => {
     // Two-step confirm so accidental clicks can't nuke a workspace.
@@ -240,52 +225,10 @@ export function MemoryWorkspace({ onToast }: MemoryWorkspaceProps) {
     }
   }, [onToast, mode]);
 
-  // #2281: clicking "View Vault" must never silently no-op. Some
-  // users don't have Obsidian installed, in which case the OS shell
-  // accepts the `obsidian://` URL and does nothing visible. We always
-  // emit a toast that names the vault path AND offers a "Reveal
-  // Folder" action so the user has an OS-native way to inspect the
-  // vault even without Obsidian.
-  const handleViewVault = useCallback(
-    async (contentRootAbs: string) => {
-      const revealHandler = () => {
-        void (async () => {
-          try {
-            await revealPath(contentRootAbs);
-          } catch (err) {
-            console.error('[ui-flow][memory-workspace] revealPath failed', err);
-            onToast?.({
-              type: 'error',
-              title: t('workspace.revealVaultFailed'),
-              message: err instanceof Error ? err.message : String(err),
-            });
-          }
-        })();
-      };
-      const err = await openVaultInObsidian(contentRootAbs);
-      if (err === null) {
-        onToast?.({
-          type: 'info',
-          title: t('workspace.openingVaultTitle'),
-          message: `${t('workspace.openingVaultMessage')} ${contentRootAbs}`,
-          action: { label: t('workspace.revealFolder'), handler: revealHandler },
-        });
-      } else {
-        onToast?.({
-          type: 'error',
-          title: t('workspace.openVaultFailedTitle'),
-          message: `${t('workspace.openVaultFailedMessage')} ${contentRootAbs}`,
-          action: { label: t('workspace.revealFolder'), handler: revealHandler },
-        });
-      }
-    },
-    [onToast, t]
-  );
-
   return (
     <div className="space-y-4" data-testid="memory-workspace">
-      <MemorySources syncableToolkits={SYNCABLE_TOOLKITS} pollIntervalMs={5000} onToast={onToast} />
-      <VaultPanel onToast={onToast} />
+      <MemoryTreeStatusPanel onToast={onToast} />
+      <MemorySourcesRegistry onToast={onToast} />
       <WhatsAppMemorySection />
 
       <div
@@ -356,18 +299,7 @@ export function MemoryWorkspace({ onToast }: MemoryWorkspaceProps) {
             )}
           </button>
           {graph && (
-            <button
-              type="button"
-              onClick={() => void handleViewVault(graph.content_root_abs)}
-              data-testid="memory-open-in-obsidian"
-              className="inline-flex items-center gap-2 rounded-lg
-                         bg-violet-500 px-4 py-2 text-sm font-semibold text-white
-                         shadow-sm transition-colors hover:bg-violet-600
-                         focus:outline-none focus:ring-2 focus:ring-violet-300"
-              title={`obsidian://open?path=${graph.content_root_abs}`}>
-              <ExternalLinkIcon />
-              {t('workspace.viewVault')}
-            </button>
+            <ObsidianVaultSection contentRootAbs={graph.content_root_abs} onToast={onToast} />
           )}
         </div>
       </div>
@@ -381,13 +313,15 @@ export function MemoryWorkspace({ onToast }: MemoryWorkspaceProps) {
           {t('workspace.loadingGraph')}
         </div>
       ) : (
-        <MemoryGraph
-          nodes={graph.nodes}
-          edges={graph.edges}
-          mode={mode}
-          contentRootAbs={graph.content_root_abs}
-        />
+        <MemoryGraph nodes={graph.nodes} edges={graph.edges} mode={mode} />
       )}
+
+      <div className="rounded-lg border border-stone-100 dark:border-neutral-800 bg-white dark:bg-neutral-900 p-4">
+        <h3 className="mb-2 text-sm font-medium text-stone-700 dark:text-neutral-200">
+          {t('sync.auditTitle', 'Sync History')}
+        </h3>
+        <SyncAuditPanel />
+      </div>
     </div>
   );
 }
@@ -490,25 +424,6 @@ function BrainIcon() {
       <path d="M9 4.5a2.5 2.5 0 015 0v15a2.5 2.5 0 01-5 0" />
       <path d="M9 4.5A2.5 2.5 0 116.5 7M9 19.5A2.5 2.5 0 116.5 17" />
       <path d="M14 4.5A2.5 2.5 0 1117.5 7M14 19.5A2.5 2.5 0 1017.5 17" />
-    </svg>
-  );
-}
-
-function ExternalLinkIcon() {
-  return (
-    <svg
-      width="16"
-      height="16"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="1.8"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      aria-hidden="true">
-      <path d="M14 3h7v7" />
-      <path d="M10 14L21 3" />
-      <path d="M21 14v7H3V3h7" />
     </svg>
   );
 }

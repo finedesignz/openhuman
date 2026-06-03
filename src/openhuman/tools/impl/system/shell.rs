@@ -1,7 +1,7 @@
 use crate::openhuman::agent::host_runtime::RuntimeAdapter;
 use crate::openhuman::javascript::NodeBootstrap;
-use crate::openhuman::security::{AuditLogger, CommandExecutionLog, SecurityPolicy};
-use crate::openhuman::tools::traits::{Tool, ToolResult};
+use crate::openhuman::security::{AuditLogger, CommandExecutionLog, GateDecision, SecurityPolicy};
+use crate::openhuman::tools::traits::{PermissionLevel, Tool, ToolResult};
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
@@ -14,7 +14,28 @@ const MAX_OUTPUT_BYTES: usize = 1_048_576;
 /// Environment variables safe to pass to shell commands.
 /// Only functional variables are included — never API keys or secrets.
 const SAFE_ENV_VARS: &[&str] = &[
-    "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
+    "PATH",
+    "HOME",
+    "TERM",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "USER",
+    "SHELL",
+    "TMPDIR",
+    // Windows process creation and child command lookup need these after env_clear().
+    "SystemRoot",
+    "WINDIR",
+    "COMSPEC",
+    "PATHEXT",
+    "TEMP",
+    "TMP",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "ProgramFiles",
+    "ProgramFiles(x86)",
+    "ProgramW6432",
 ];
 
 /// Shell command execution tool with sandboxing
@@ -99,7 +120,9 @@ impl Tool for ShellTool {
     }
 
     fn description(&self) -> &str {
-        "Execute a shell command in the workspace directory"
+        "Execute a shell command. Use this to run code, manipulate files in the workspace, \
+         or perform system actions on the user's machine — including launching applications \
+         (e.g. `open -a Music` on macOS, `xdg-open music://` on Linux)."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -110,10 +133,10 @@ impl Tool for ShellTool {
                     "type": "string",
                     "description": "The shell command to execute"
                 },
-                "approved": {
-                    "type": "boolean",
-                    "description": "Set true to explicitly approve medium/high-risk commands in supervised mode",
-                    "default": false
+                "category": {
+                    "type": "string",
+                    "enum": ["read", "write", "network", "install", "destructive"],
+                    "description": "Optional self-declared risk category for this command. Advisory and ESCALATE-ONLY: it can raise the approval requirement (e.g. flag a destructive command) but never lowers what the runtime determines."
                 }
             },
             "required": ["command"]
@@ -129,19 +152,48 @@ impl Tool for ShellTool {
         Some(30_000)
     }
 
+    fn permission_level(&self) -> PermissionLevel {
+        PermissionLevel::Execute
+    }
+
+    /// Whether this shell call must be approved by the human before it runs.
+    /// True for any command the current tier prompts on (Write / Network /
+    /// Destructive in ask-before-edit; Network / Destructive in Full). The
+    /// harness routes these through the `ApprovalGate`; the read-only `Block`
+    /// and the structural guard are enforced in `run_with_security`.
+    fn external_effect_with_args(&self, args: &serde_json::Value) -> bool {
+        let command = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
+        let mut class = self.security.classify_command(command);
+        // Escalate-only LLM hint: max() so a self-declared category can raise
+        // the requirement (e.g. Write -> Destructive) but never lower it.
+        if let Some(declared) = args
+            .get("category")
+            .and_then(|v| v.as_str())
+            .and_then(SecurityPolicy::parse_declared_class)
+        {
+            class = class.max(declared);
+        }
+        self.security.gate_decision(class) == GateDecision::Prompt
+    }
+
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let command = args
             .get("command")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'command' parameter"))?;
-        let approved = args
-            .get("approved")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
 
         let start = Instant::now();
-        let (allowed, result) = self.run_with_security(command, approved).await;
+        let (allowed, result) = self.run_with_security(command).await;
         let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        // `allowed` = passed the in-tool security checks. `approved` = the command
+        // is Prompt-class (required human approval) and thus went through the
+        // harness ApprovalGate to reach here — distinct from `allowed`. Reads and
+        // Full-mode writes run without a prompt, so they audit as approved=false
+        // rather than over-claiming a human approval that never happened. (The
+        // gate's exact yes/no isn't threaded into tools; this is the accurate
+        // "required approval" proxy.)
+        let approved = self.external_effect_with_args(&args);
+        // emit_audit signature is (command, approved, allowed, …) — keep that order.
         self.emit_audit(command, approved, allowed, !result.is_error, duration_ms);
         Ok(result)
     }
@@ -151,16 +203,25 @@ impl ShellTool {
     /// Run the command through the security policy and runtime. Returns
     /// `(allowed, result)` where `allowed=false` means the policy or rate
     /// limiter blocked execution before the command was launched.
-    async fn run_with_security(&self, command: &str, approved: bool) -> (bool, ToolResult) {
+    ///
+    /// Exposed as `pub(crate)` so workflow phase scripts can reuse the
+    /// same gated execution path as the `shell` tool — all security
+    /// checks (rate limits, path guards, approval gate routing) apply
+    /// identically to workflow-triggered commands.
+    pub(crate) async fn run_with_security(&self, command: &str) -> (bool, ToolResult) {
+        // Read-only `Block` + the Option-2 structural guard. Approval for
+        // Write / Network / Destructive already happened at the harness
+        // `ApprovalGate` (see `external_effect_with_args`) before `execute()`
+        // ran; this enforces what must still hold afterwards.
+        if let Err(reason) = self.security.check_gated_command(command) {
+            return (false, ToolResult::error(reason));
+        }
+
         if self.security.is_rate_limited() {
             return (
                 false,
                 ToolResult::error("Rate limit exceeded: too many actions in the last hour"),
             );
-        }
-
-        if let Err(reason) = self.security.validate_command_execution(command, approved) {
-            return (false, ToolResult::error(reason));
         }
 
         if !self.security.record_action() {
@@ -175,7 +236,7 @@ impl ShellTool {
         // (CWE-200), then re-add only safe, functional variables.
         let mut cmd = match self
             .runtime
-            .build_shell_command(command, &self.security.workspace_dir)
+            .build_shell_command(command, &self.security.action_dir)
         {
             Ok(cmd) => cmd,
             Err(e) => {
@@ -264,12 +325,13 @@ impl ShellTool {
 mod tests {
     use super::*;
     use crate::openhuman::agent::host_runtime::{NativeRuntime, RuntimeAdapter};
-    use crate::openhuman::security::{AutonomyLevel, SecurityPolicy};
+    use crate::openhuman::security::{AutonomyLevel, CommandClass, SecurityPolicy};
 
     fn test_security(autonomy: AutonomyLevel) -> Arc<SecurityPolicy> {
         Arc::new(SecurityPolicy {
             autonomy,
             workspace_dir: std::env::temp_dir(),
+            action_dir: std::env::temp_dir(),
             ..SecurityPolicy::default()
         })
     }
@@ -333,7 +395,11 @@ mod tests {
             test_runtime(),
             audit,
         );
-        let _ = tool.execute(json!({"command": "ls"})).await.unwrap();
+        // A write command in read-only mode is denied before execution.
+        let _ = tool
+            .execute(json!({"command": "touch denied_file"}))
+            .await
+            .unwrap();
         let log = std::fs::read_to_string(tmp.path().join("audit.log"))
             .expect("audit log file should exist");
         let parsed: AuditEvent = serde_json::from_str(log.trim()).expect("audit event JSON parses");
@@ -377,7 +443,9 @@ mod tests {
             .as_array()
             .unwrap()
             .contains(&json!("command")));
-        assert!(schema["properties"]["approved"].is_object());
+        // The self-asserted `approved` param was removed — approval now happens
+        // at the harness ApprovalGate, not via a model-set flag.
+        assert!(schema["properties"]["approved"].is_null());
     }
 
     #[cfg(not(windows))]
@@ -398,28 +466,148 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shell_blocks_disallowed_command() {
-        let tool = ShellTool::new(
-            test_security(AutonomyLevel::Supervised),
-            test_runtime(),
-            test_audit(),
+    async fn shell_destructive_command_is_gated_not_run_inline() {
+        // `rm -rf /` is Destructive → it must route through the human approval
+        // gate (external_effect), never auto-run. Assert the classification
+        // here rather than executing it.
+        let security = test_security(AutonomyLevel::Supervised);
+        let tool = ShellTool::new(security.clone(), test_runtime(), test_audit());
+        assert_eq!(
+            security.classify_command("rm -rf /"),
+            CommandClass::Destructive
         );
-        let result = tool.execute(json!({"command": "rm -rf /"})).await.unwrap();
-        assert!(result.is_error);
-        let error = result.output();
-        assert!(error.contains("not allowed") || error.contains("high-risk"));
+        assert!(tool.external_effect_with_args(&json!({"command": "rm -rf /"})));
+    }
+
+    /// End-to-end regression guard for #3238.
+    ///
+    /// PR #3074 split `Config.action_dir` (the agent's read/write root)
+    /// from `Config.workspace_dir` (internal product state). `ShellTool`
+    /// is contractually obligated to spawn its child process with
+    /// `current_dir = security.action_dir` so `pwd` inside the shell
+    /// reports the action sandbox path, never `workspace_dir` and never
+    /// the cargo-test caller's CWD.
+    ///
+    /// This test constructs a `SecurityPolicy` whose `action_dir` is a
+    /// fresh tempdir (distinct from `workspace_dir` and from `cwd`),
+    /// runs `pwd`, and asserts the captured stdout canonicalises to the
+    /// same path as `action_dir`. If `ShellTool::run_with_security`
+    /// stops passing `&security.action_dir` to `build_shell_command`
+    /// (or `build_shell_command` stops calling `current_dir`), this
+    /// test fails before the regression ships.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn shell_pwd_returns_action_dir_not_workspace_dir() {
+        let action_tmp = tempfile::tempdir().expect("create action tempdir");
+        let workspace_tmp = tempfile::tempdir().expect("create workspace tempdir");
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace_tmp.path().to_path_buf(),
+            action_dir: action_tmp.path().to_path_buf(),
+            ..SecurityPolicy::default()
+        });
+        let tool = ShellTool::new(security.clone(), test_runtime(), test_audit());
+
+        let result = tool
+            .execute(json!({"command": "pwd"}))
+            .await
+            .expect("pwd should execute without harness error");
+        assert!(
+            !result.is_error,
+            "pwd unexpectedly errored: {}",
+            result.output()
+        );
+
+        // Canonicalise both sides — on macOS `/tmp` is a symlink to
+        // `/private/tmp`, so the raw strings won't match even when the
+        // paths are the same.
+        let reported = std::path::PathBuf::from(result.output().trim());
+        let actual = reported.canonicalize().unwrap_or_else(|_| reported.clone());
+        let expected = security
+            .action_dir
+            .canonicalize()
+            .unwrap_or_else(|_| security.action_dir.clone());
+        let workspace_canon = security
+            .workspace_dir
+            .canonicalize()
+            .unwrap_or_else(|_| security.workspace_dir.clone());
+
+        assert_eq!(
+            actual,
+            expected,
+            "pwd must report `action_dir`. got `{}`, expected `{}`. \
+             If this fails, `ShellTool::run_with_security` likely stopped \
+             passing `&security.action_dir` to `runtime.build_shell_command`, \
+             or `build_shell_command` stopped calling `current_dir(...)`. See #3238.",
+            actual.display(),
+            expected.display(),
+        );
+        assert_ne!(
+            actual, workspace_canon,
+            "pwd reported `workspace_dir` instead of `action_dir` — the \
+             action/internal split is broken. See #3074, #3238."
+        );
+    }
+
+    /// Source-level regression guard for #3238.
+    ///
+    /// Locks in the contract that the three shell-family acting tools
+    /// (`shell`, `node_exec`, `npm_exec`) resolve their CWD against
+    /// `security.action_dir`, never `security.workspace_dir`. The
+    /// behavioural assertion above covers `shell`; this guard catches
+    /// regressions in `node_exec` / `npm_exec` without requiring a real
+    /// Node.js install in CI (their `execute()` path runs
+    /// `NodeBootstrap::resolve()` first, which is brittle to mock).
+    ///
+    /// If a future refactor accidentally switches any of these tools
+    /// back to `workspace_dir`, this assertion fires at compile-time
+    /// string-match level.
+    #[test]
+    fn shell_family_tools_route_cwd_through_action_dir() {
+        const SHELL_SRC: &str = include_str!("shell.rs");
+        const NODE_EXEC_SRC: &str = include_str!("node_exec.rs");
+        const NPM_EXEC_SRC: &str = include_str!("npm_exec.rs");
+
+        // Compose forbidden patterns at runtime so this test's own source
+        // doesn't trigger the contains() check on itself.
+        let bad_field = format!("self.security.{}_dir", "workspace");
+        let bad_call_1 = format!("build_shell_command(&command, &{bad_field})");
+        let bad_call_2 = format!("build_shell_command(command, &{bad_field})");
+
+        for (name, src) in [
+            ("shell.rs", SHELL_SRC),
+            ("node_exec.rs", NODE_EXEC_SRC),
+            ("npm_exec.rs", NPM_EXEC_SRC),
+        ] {
+            assert!(
+                src.contains("self.security.action_dir"),
+                "{name} must reference `self.security.action_dir` for tool CWD \
+                 (see #3074, #3238)"
+            );
+            assert!(
+                !src.contains(&bad_call_1) && !src.contains(&bad_call_2),
+                "{name} must not pass `workspace_dir` to `build_shell_command` — \
+                 acting tools spawn into `action_dir`. See #3074, #3238."
+            );
+        }
     }
 
     #[tokio::test]
-    async fn shell_blocks_readonly() {
-        let tool = ShellTool::new(
-            test_security(AutonomyLevel::ReadOnly),
-            test_runtime(),
-            test_audit(),
+    async fn shell_readonly_allows_reads_blocks_writes() {
+        let security = test_security(AutonomyLevel::ReadOnly);
+        // Read commands are permitted in read-only mode…
+        assert_eq!(
+            security.gate_decision(security.classify_command("ls")),
+            GateDecision::Allow
         );
-        let result = tool.execute(json!({"command": "ls"})).await.unwrap();
-        assert!(result.is_error);
-        assert!(&result.output().contains("not allowed"));
+        // …but a write command is blocked before execution.
+        let tool = ShellTool::new(security, test_runtime(), test_audit());
+        let blocked = tool
+            .execute(json!({"command": "touch ro_test_file"}))
+            .await
+            .unwrap();
+        assert!(blocked.is_error);
+        assert!(blocked.output().contains("read-only"));
     }
 
     #[tokio::test]
@@ -463,6 +651,7 @@ mod tests {
         Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
             workspace_dir: std::env::temp_dir(),
+            action_dir: std::env::temp_dir(),
             allowed_commands: vec!["echo".into(), "mkdir".into()],
             ..SecurityPolicy::default()
         })
@@ -535,41 +724,37 @@ mod tests {
         );
     }
 
-    #[cfg(not(windows))]
     #[tokio::test]
-    async fn shell_requires_approval_for_medium_risk_command() {
-        let security = Arc::new(SecurityPolicy {
-            autonomy: AutonomyLevel::Supervised,
-            allowed_commands: vec!["touch".into(), "mkdir".into()],
-            workspace_dir: std::env::temp_dir(),
-            ..SecurityPolicy::default()
-        });
+    async fn shell_writes_are_gated_in_supervised_run_in_full() {
+        // A write command routes through the approval gate in ask-before-edit
+        // (no self-asserted `approved` flag any more)…
+        let supervised = test_security(AutonomyLevel::Supervised);
+        let tool = ShellTool::new(supervised.clone(), test_runtime(), test_audit());
+        assert_eq!(supervised.classify_command("touch f"), CommandClass::Write);
+        assert!(tool.external_effect_with_args(&json!({"command": "touch f"})));
 
-        let tool = ShellTool::new(security.clone(), test_runtime(), test_audit());
-        let command = if cfg!(windows) {
-            "mkdir openhuman_shell_approval_test"
-        } else {
-            "touch openhuman_shell_approval_test"
-        };
-        let denied = tool.execute(json!({"command": command})).await.unwrap();
-        assert!(denied.is_error);
-        assert!(denied.output().contains("explicit approval"));
+        // …and runs without prompting in Full.
+        let full = test_security(AutonomyLevel::Full);
+        let full_tool = ShellTool::new(full, test_runtime(), test_audit());
+        assert!(!full_tool.external_effect_with_args(&json!({"command": "touch f"})));
+    }
 
-        let allowed = tool
-            .execute(json!({
-                "command": command,
-                "approved": true
-            }))
-            .await
-            .unwrap();
-        assert!(!allowed.is_error, "{}", allowed.output());
-
-        let cleanup = std::env::temp_dir().join("openhuman_shell_approval_test");
-        if cfg!(windows) {
-            let _ = tokio::fs::remove_dir_all(&cleanup).await;
-        } else {
-            let _ = tokio::fs::remove_file(&cleanup).await;
-        }
+    #[tokio::test]
+    async fn shell_llm_category_escalates_but_never_lowers() {
+        // In Full a Write runs silently…
+        let full = test_security(AutonomyLevel::Full);
+        let tool = ShellTool::new(full, test_runtime(), test_audit());
+        assert!(!tool.external_effect_with_args(&json!({"command": "touch f"})));
+        // …but a self-declared `destructive` escalates it to a prompt.
+        assert!(tool
+            .external_effect_with_args(&json!({"command": "touch f", "category": "destructive"})));
+        // The hint can never LOWER: declaring a destructive command "read"
+        // still prompts (in any acting tier).
+        let supervised = test_security(AutonomyLevel::Supervised);
+        let stool = ShellTool::new(supervised, test_runtime(), test_audit());
+        assert!(
+            stool.external_effect_with_args(&json!({"command": "sudo reboot", "category": "read"}))
+        );
     }
 
     // ── §5.2 Shell timeout enforcement tests ─────────────────
@@ -616,12 +801,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn shell_safe_env_vars_include_windows_process_essentials() {
+        for var in ["SystemRoot", "COMSPEC", "PATHEXT", "TEMP", "USERPROFILE"] {
+            assert!(
+                SAFE_ENV_VARS.contains(&var),
+                "{var} must be forwarded for Windows child processes"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn shell_blocks_rate_limited() {
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
             max_actions_per_hour: 0,
             workspace_dir: std::env::temp_dir(),
+            action_dir: std::env::temp_dir(),
             ..SecurityPolicy::default()
         });
         let tool = ShellTool::new(security, test_runtime(), test_audit());

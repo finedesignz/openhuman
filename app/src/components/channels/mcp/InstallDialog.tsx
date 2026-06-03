@@ -7,6 +7,7 @@
 import debug from 'debug';
 import { useCallback, useEffect, useRef, useState } from 'react';
 
+import { useT } from '../../../lib/i18n/I18nContext';
 import { mcpClientsApi } from '../../../services/api/mcpClientsApi';
 import type { InstalledServer, SmitheryServerDetail } from './types';
 
@@ -20,6 +21,7 @@ interface InstallDialogProps {
 }
 
 const InstallDialog = ({ qualifiedName, prefillEnv, onSuccess, onCancel }: InstallDialogProps) => {
+  const { t } = useT();
   const [detail, setDetail] = useState<SmitheryServerDetail | null>(null);
   const [loadingDetail, setLoadingDetail] = useState(true);
   const [detailError, setDetailError] = useState<string | null>(null);
@@ -61,7 +63,7 @@ const InstallDialog = ({ qualifiedName, prefillEnv, onSuccess, onCancel }: Insta
       })
       .catch(err => {
         if (latestQualifiedNameRef.current !== requestedName) return;
-        const msg = err instanceof Error ? err.message : 'Failed to load server details';
+        const msg = err instanceof Error ? err.message : t('mcp.install.failedDetail');
         log('detail error: %s', msg);
         setDetailError(msg);
       })
@@ -70,7 +72,7 @@ const InstallDialog = ({ qualifiedName, prefillEnv, onSuccess, onCancel }: Insta
           setLoadingDetail(false);
         }
       });
-  }, [qualifiedName, prefillEnv]);
+  }, [qualifiedName, prefillEnv, t]);
 
   const toggleShowEnv = useCallback((key: string) => {
     setShowEnv(prev => ({ ...prev, [key]: !prev[key] }));
@@ -86,7 +88,7 @@ const InstallDialog = ({ qualifiedName, prefillEnv, onSuccess, onCancel }: Insta
     // Validate required keys are filled.
     for (const key of detail.required_env_keys ?? []) {
       if (!envValues[key]?.trim()) {
-        setInstallError(`"${key}" is required`);
+        setInstallError(t('mcp.install.missingRequired').replace('{key}', key));
         return;
       }
     }
@@ -97,7 +99,7 @@ const InstallDialog = ({ qualifiedName, prefillEnv, onSuccess, onCancel }: Insta
       try {
         parsedConfig = JSON.parse(configJson.trim());
       } catch {
-        setInstallError('Config JSON is not valid JSON');
+        setInstallError(t('mcp.install.invalidJson'));
         return;
       }
     }
@@ -113,20 +115,34 @@ const InstallDialog = ({ qualifiedName, prefillEnv, onSuccess, onCancel }: Insta
         config: parsedConfig,
       });
       log('install success server_id=%s', server.server_id);
+      // Best-effort auto-connect — fire-and-forget so the dialog closes
+      // immediately on install success. A slow or failing handshake must
+      // never block onSuccess (the detail view surfaces errors and offers
+      // a Connect retry).
+      void mcpClientsApi
+        .connect(server.server_id)
+        .then(() => log('auto-connect success server_id=%s', server.server_id))
+        .catch((connectErr: unknown) =>
+          log(
+            'auto-connect failed server_id=%s: %s',
+            server.server_id,
+            connectErr instanceof Error ? connectErr.message : String(connectErr)
+          )
+        );
       onSuccess(server);
     } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Install failed';
+      const msg = err instanceof Error ? err.message : t('mcp.install.failedInstall');
       log('install error: %s', msg);
       setInstallError(msg);
     } finally {
       setInstalling(false);
     }
-  }, [detail, envValues, configJson, qualifiedName, onSuccess]);
+  }, [detail, envValues, configJson, qualifiedName, onSuccess, t]);
 
   if (loadingDetail) {
     return (
       <div className="py-10 text-center text-sm text-stone-400 dark:text-neutral-500">
-        Loading server details...
+        {t('mcp.install.loadingDetail')}
       </div>
     );
   }
@@ -141,7 +157,7 @@ const InstallDialog = ({ qualifiedName, prefillEnv, onSuccess, onCancel }: Insta
           type="button"
           onClick={onCancel}
           className="text-sm text-stone-500 dark:text-neutral-400 hover:underline">
-          Go back
+          {t('mcp.install.back')}
         </button>
       </div>
     );
@@ -166,7 +182,7 @@ const InstallDialog = ({ qualifiedName, prefillEnv, onSuccess, onCancel }: Insta
         )}
         <div>
           <h3 className="text-base font-semibold text-stone-900 dark:text-neutral-100">
-            Install {detail.display_name}
+            {t('mcp.install.title').replace('{name}', detail.display_name)}
           </h3>
           {detail.description && (
             <p className="text-xs text-stone-500 dark:text-neutral-400 mt-0.5">
@@ -180,7 +196,7 @@ const InstallDialog = ({ qualifiedName, prefillEnv, onSuccess, onCancel }: Insta
       {(detail.required_env_keys ?? []).length > 0 && (
         <div className="space-y-2">
           <p className="text-xs font-medium text-stone-700 dark:text-neutral-300">
-            Required environment variables
+            {t('mcp.install.requiredEnv')}
           </p>
           {detail.required_env_keys!.map(key => (
             <div key={key} className="space-y-1">
@@ -195,7 +211,7 @@ const InstallDialog = ({ qualifiedName, prefillEnv, onSuccess, onCancel }: Insta
                   type={showEnv[key] ? 'text' : 'password'}
                   value={envValues[key] ?? ''}
                   onChange={e => handleEnvChange(key, e.target.value)}
-                  placeholder={`Enter ${key}`}
+                  placeholder={t('mcp.install.enterValue').replace('{key}', key)}
                   disabled={installing}
                   className="flex-1 rounded-lg border border-stone-200 dark:border-neutral-700 bg-white dark:bg-neutral-900 px-3 py-1.5 text-sm text-stone-800 dark:text-neutral-100 placeholder:text-stone-400 dark:placeholder:text-neutral-500 focus:outline-none focus:ring-2 focus:ring-primary-500/40 disabled:opacity-50"
                 />
@@ -204,7 +220,7 @@ const InstallDialog = ({ qualifiedName, prefillEnv, onSuccess, onCancel }: Insta
                   onClick={() => toggleShowEnv(key)}
                   disabled={installing}
                   className="shrink-0 rounded-lg border border-stone-200 dark:border-neutral-700 px-2 py-1 text-xs text-stone-500 dark:text-neutral-400 hover:border-stone-300 dark:hover:border-neutral-600 disabled:opacity-50">
-                  {showEnv[key] ? 'Hide' : 'Show'}
+                  {showEnv[key] ? t('mcp.install.hide') : t('mcp.install.show')}
                 </button>
               </div>
             </div>
@@ -217,7 +233,7 @@ const InstallDialog = ({ qualifiedName, prefillEnv, onSuccess, onCancel }: Insta
         <label
           htmlFor="mcp-config-json"
           className="block text-xs font-medium text-stone-600 dark:text-neutral-400">
-          Config (optional JSON)
+          {t('mcp.install.configLabel')}
         </label>
         <textarea
           id="mcp-config-json"
@@ -225,7 +241,7 @@ const InstallDialog = ({ qualifiedName, prefillEnv, onSuccess, onCancel }: Insta
           onChange={e => setConfigJson(e.target.value)}
           disabled={installing}
           rows={4}
-          placeholder='{"key": "value"}'
+          placeholder={t('mcp.install.configPlaceholder')}
           className="w-full rounded-lg border border-stone-200 dark:border-neutral-700 bg-white dark:bg-neutral-900 px-3 py-2 text-sm font-mono text-stone-800 dark:text-neutral-100 placeholder:text-stone-400 dark:placeholder:text-neutral-500 focus:outline-none focus:ring-2 focus:ring-primary-500/40 disabled:opacity-50 resize-y"
         />
       </div>
@@ -244,14 +260,14 @@ const InstallDialog = ({ qualifiedName, prefillEnv, onSuccess, onCancel }: Insta
           disabled={installing}
           onClick={() => void handleInstall()}
           className="rounded-lg bg-primary-500 px-4 py-2 text-sm font-medium text-white hover:bg-primary-600 disabled:opacity-50 transition-colors">
-          {installing ? 'Installing...' : 'Install'}
+          {installing ? t('mcp.install.installing') : t('mcp.install.button')}
         </button>
         <button
           type="button"
           disabled={installing}
           onClick={onCancel}
           className="rounded-lg border border-stone-200 dark:border-neutral-700 px-4 py-2 text-sm font-medium text-stone-600 dark:text-neutral-300 hover:border-stone-300 dark:hover:border-neutral-600 disabled:opacity-50">
-          Cancel
+          {t('common.cancel')}
         </button>
       </div>
     </div>

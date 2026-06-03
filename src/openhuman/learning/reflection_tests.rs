@@ -203,6 +203,19 @@ fn build_reflection_prompt_includes_tool_calls_and_truncation() {
 }
 
 #[test]
+fn build_reflection_prompt_includes_output_language_directive() {
+    let memory: Arc<dyn Memory> = Arc::new(MockMemory::default());
+    let mut config = Config::default();
+    config.output_language = Some("zh-CN".into());
+    let hook = ReflectionHook::new(reflection_config(), Arc::new(config), memory, None);
+
+    let prompt = hook.build_reflection_prompt(&reflective_turn());
+    assert!(prompt.contains("Simplified Chinese"));
+    assert!(prompt.contains("Keep JSON keys"));
+    assert!(prompt.contains("\"observations\""));
+}
+
+#[test]
 fn session_key_and_counter_management_work() {
     let hook = ReflectionHook::new(
         reflection_config(),
@@ -257,6 +270,53 @@ async fn store_reflection_persists_all_categories() {
     assert!(
         !keys.iter().any(|key| key.starts_with("ref/")),
         "store_reflection must not persist user_reflections — that path now lives in on_turn_complete so the dedupe set is shared with the heuristic"
+    );
+}
+
+#[tokio::test]
+async fn store_reflection_persists_every_pattern_and_pref_concurrently() {
+    // Regression guard for the `join_all` batching: every independent
+    // pattern / preference write must land regardless of completion order
+    // (the old code awaited them one at a time).
+    let memory_impl = Arc::new(MockMemory::default());
+    let memory: Arc<dyn Memory> = memory_impl.clone();
+    let hook = ReflectionHook::new(
+        reflection_config(),
+        Arc::new(Config::default()),
+        memory,
+        None,
+    );
+
+    hook.store_reflection(&ReflectionOutput {
+        observations: Vec::new(),
+        patterns: vec![
+            "Pattern One".into(),
+            "Pattern Two".into(),
+            "Pattern Three".into(),
+        ],
+        user_preferences: vec!["Pref One".into(), "Pref Two".into()],
+        user_reflections: Vec::new(),
+    })
+    .await
+    .unwrap();
+
+    let keys: Vec<String> = memory_impl.entries.lock().keys().cloned().collect();
+    for expected in [
+        "pat/pattern_one",
+        "pat/pattern_two",
+        "pat/pattern_three",
+        "pref/pref_one",
+        "pref/pref_two",
+    ] {
+        assert!(
+            keys.iter().any(|key| key == expected),
+            "missing {expected}; got {keys:?}"
+        );
+    }
+    assert_eq!(
+        keys.len(),
+        5,
+        "all 5 independent writes must persist; got {keys:?}"
     );
 }
 

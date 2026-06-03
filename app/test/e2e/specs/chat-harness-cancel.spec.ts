@@ -32,6 +32,7 @@ import {
   getSelectedThreadId,
   hexEncodeThreadId,
   typeIntoComposer,
+  waitForSocketConnected,
 } from '../helpers/chat-harness';
 import { callOpenhumanRpc } from '../helpers/core-rpc';
 import { textExists } from '../helpers/element-helpers';
@@ -111,6 +112,10 @@ describe('Chat harness — mid-stream cancel', () => {
     expect(await clickByTitle('New thread', 8_000)).toBe(true);
 
     await typeIntoComposer(PROMPT);
+    const socketReady = await waitForSocketConnected(30_000);
+    if (!socketReady) {
+      console.warn('[chat-harness-cancel] socket did not connect within 30 s — send may fail');
+    }
     expect(
       await browser.waitUntil(async () => await clickSend(), {
         timeout: 5_000,
@@ -157,7 +162,7 @@ describe('Chat harness — mid-stream cancel', () => {
     // The textarea must be re-enabled.
     const composerEnabled = await browser.execute(() => {
       const ta = document.querySelector(
-        'textarea[placeholder="Type a message..."]'
+        'textarea[placeholder="How can I help you today?"]'
       ) as HTMLTextAreaElement | null;
       return !!ta && !ta.disabled;
     });

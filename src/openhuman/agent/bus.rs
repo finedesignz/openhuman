@@ -82,6 +82,10 @@ pub struct AgentTurnRequest {
     /// size caps).
     pub multimodal: MultimodalConfig,
 
+    /// File-attachment feature configuration (file marker count caps,
+    /// per-file size budget, extracted-text limits, MIME allowlist).
+    pub multimodal_files: crate::openhuman::config::MultimodalFileConfig,
+
     /// Maximum number of LLM↔tool round-trips before bailing out.
     /// Prevents infinite loops if a model gets "stuck" calling the same tool.
     pub max_tool_iterations: usize,
@@ -152,6 +156,7 @@ pub fn register_agent_handlers() {
                 silent,
                 channel_name,
                 multimodal,
+                multimodal_files,
                 max_tool_iterations,
                 on_delta,
                 target_agent_id,
@@ -243,13 +248,9 @@ pub fn register_agent_handlers() {
                     &model,
                     temperature,
                     silent,
-                    // Approval is not wired into the channel path today; if
-                    // CLI migrates to the bus later, extend AgentTurnRequest
-                    // with `approval: Option<Arc<ApprovalManager>>` and pass
-                    // it through here.
-                    None,
                     &channel_name,
                     &multimodal,
+                    &multimodal_files,
                     max_tool_iterations,
                     on_delta,
                     visible_tool_names.as_ref(),
@@ -260,6 +261,10 @@ pub fn register_agent_handlers() {
                     // wired into the orchestrator session via Agent::turn,
                     // not the bus dispatcher.
                     None,
+                    // Use the default (allow-all) tool policy. Custom
+                    // policies can be wired in via AgentTurnRequest when
+                    // per-channel policy configuration is added (#2134).
+                    &crate::openhuman::tools::policy::DefaultToolPolicy,
                 )
                 .await
             })
@@ -403,6 +408,7 @@ mod tests {
             silent: true,
             channel_name: "test-channel".into(),
             multimodal: MultimodalConfig::default(),
+            multimodal_files: crate::openhuman::config::MultimodalFileConfig::default(),
             max_tool_iterations: 1,
             on_delta: None,
             target_agent_id: None,

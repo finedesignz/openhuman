@@ -13,6 +13,7 @@ use crate::openhuman::channels::context::{
     conversation_memory_key, is_context_window_overflow_error, ChannelRuntimeContext,
     CHANNEL_TYPING_REFRESH_INTERVAL_SECS, MAX_CHANNEL_HISTORY,
 };
+use crate::openhuman::channels::providers::telegram::TELEGRAM_APPROVAL_CLIENT_ID;
 use crate::openhuman::channels::routes::{
     get_or_create_provider, get_route_selection, handle_runtime_command_if_needed,
 };
@@ -192,94 +193,6 @@ fn log_worker_join_result(result: Result<(), tokio::task::JoinError>) {
     }
 }
 
-/// Build a `[CONNECTION_STATE]...[/CONNECTION_STATE]` block listing the
-/// current Composio connection status for each connected or available
-/// integration.
-///
-/// Fetches integration state at call time so the agent always sees the
-/// up-to-date status for the user's current turn (including connections
-/// that completed mid-conversation via OAuth in a browser). The fetch is
-/// wrapped in a short timeout so Composio API latency never blocks the
-/// channel turn.
-///
-/// Returns an empty string on any failure (API down, not authenticated,
-/// timeout) so the caller can safely append it without branching.
-async fn build_connection_state_block() -> String {
-    // 3-second ceiling — connection state is best-effort context. If the
-    // Composio API is slow, skip the block rather than delaying the turn.
-    const COMPOSIO_FETCH_TIMEOUT_SECS: u64 = 3;
-
-    let config = match tokio::time::timeout(
-        Duration::from_secs(COMPOSIO_FETCH_TIMEOUT_SECS),
-        Config::load_or_init(),
-    )
-    .await
-    {
-        Ok(Ok(c)) => c,
-        Ok(Err(e)) => {
-            tracing::debug!(
-                error = %e,
-                "[dispatch::connection_state] config load failed — skipping block"
-            );
-            return String::new();
-        }
-        Err(_) => {
-            tracing::debug!("[dispatch::connection_state] config load timed out — skipping block");
-            return String::new();
-        }
-    };
-
-    let integrations = match tokio::time::timeout(
-        Duration::from_secs(COMPOSIO_FETCH_TIMEOUT_SECS),
-        fetch_connected_integrations(&config),
-    )
-    .await
-    {
-        Ok(list) => list,
-        Err(_) => {
-            tracing::debug!(
-                "[dispatch::connection_state] Composio fetch timed out — skipping block"
-            );
-            return String::new();
-        }
-    };
-
-    if integrations.is_empty() {
-        tracing::debug!("[dispatch::connection_state] no integrations returned — skipping block");
-        return String::new();
-    }
-
-    let mut lines = Vec::with_capacity(integrations.len());
-    for integration in &integrations {
-        let status = if integration.connected {
-            // Include account identifier if available (first tool name often encodes it,
-            // but the toolkit slug is the clearest label available here).
-            format!("connected (toolkit: {})", integration.toolkit)
-        } else {
-            "not connected".to_string()
-        };
-        // Capitalize the toolkit name for readability (e.g. "gmail" → "Gmail").
-        let display_name = {
-            let mut chars = integration.toolkit.chars();
-            match chars.next() {
-                None => String::new(),
-                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-            }
-        };
-        lines.push(format!("{display_name}: {status}"));
-    }
-
-    tracing::debug!(
-        integration_count = integrations.len(),
-        "[dispatch::connection_state] built connection state block for welcome agent"
-    );
-
-    format!(
-        "\n\n[CONNECTION_STATE]\n{}\n[/CONNECTION_STATE]",
-        lines.join("\n")
-    )
-}
-
 fn spawn_scoped_typing_task(
     channel: Arc<dyn Channel>,
     recipient: String,
@@ -338,38 +251,9 @@ impl AgentScoping {
 /// Decide which agent should run for this channel turn and build the
 /// matching tool-scoping payload.
 ///
-/// The selection is purely a function of
-/// `config.chat_onboarding_completed`:
-///
-/// * **`false`** → route to the `welcome` agent. Welcome's TOML
-///   restricts it to two tools (`complete_onboarding`, `memory_recall`)
-///   so the LLM cannot accidentally send messages or write files
-///   while guiding the user through setup. The welcome agent decides
-///   when the user is ready and calls
-///   `complete_onboarding`, which flips the flag.
-///
-/// * **`true`** → route to the `orchestrator` agent. Orchestrator
-///   delegates real work to specialist subagents via a `subagents`
-///   field in its TOML; this function expands that field into a list
-///   of `delegate_*` tools spliced alongside the global registry.
-///
-/// We deliberately read `chat_onboarding_completed` and NOT the
-/// React-UI-managed `onboarding_completed` flag. The latter is the
-/// gate `OnboardingOverlay.tsx` uses to render its full-screen wizard
-/// in the Tauri desktop app — by the time a desktop user can type a
-/// chat message it's already `true`, so routing on it would mean
-/// welcome could never run from the Tauri app. The chat flag is set
-/// exclusively by the welcome agent itself when it calls
-/// `complete_onboarding(complete)`, so it stays `false` for the
-/// user's actual first message regardless of what the React layer
-/// did. See `Config::chat_onboarding_completed` rustdoc for the full
-/// rationale.
-///
-/// The next channel message after `complete_onboarding` flips the
-/// flag is automatically routed to the orchestrator because
-/// `Config::load_or_init()` reads from disk every call (no in-process
-/// cache, verified at `config/schema/load.rs:409`), so the new value
-/// is observed on the next turn without any explicit handoff event.
+/// All channel turns route directly to the `orchestrator` agent. The
+/// welcome agent has been removed; the Joyride walkthrough in the
+/// frontend handles onboarding UI instead.
 ///
 /// On any failure path (missing registry, missing definition, missing
 /// orchestrator delegation targets) the function logs and returns
@@ -388,23 +272,11 @@ async fn resolve_target_agent(channel: &str) -> AgentScoping {
         }
     };
 
-    // Welcome is **desktop-app only**. The web channel has its own
-    // bespoke chat path (`channels::provider::web::run_chat_task` →
-    // `pick_target_agent_id`) that routes to the welcome agent while
-    // `chat_onboarding_completed` is false. Every other channel
-    // (telegram, slack, discord, mattermost, signal, …) flows through
-    // this function, and we always send those straight to the
-    // orchestrator regardless of onboarding state — an external user
-    // pinging us from Telegram should never land on the welcome
-    // agent's narrow setup-checklist toolset, since the checklist
-    // (notifications permission, in-app account setup, etc.) is only
-    // meaningful inside the desktop app.
     let target_id = "orchestrator";
 
     tracing::info!(
         channel = %channel,
         target_agent = target_id,
-        chat_onboarding_completed = config.chat_onboarding_completed,
         ui_onboarding_completed = config.onboarding_completed,
         "[dispatch::routing] selected target agent"
     );
@@ -439,9 +311,8 @@ async fn resolve_target_agent(channel: &str) -> AgentScoping {
     // (e.g. a custom workspace-override planner that subdivides work)
     // pick this up for free.
     //
-    // Wrap the Composio fetch in the same 3-second timeout used by
-    // `build_connection_state_block` so a slow/unresponsive Composio API
-    // can never block turn dispatch indefinitely.
+    // Wrap the Composio fetch in a 3-second timeout so a slow/unresponsive
+    // Composio API can never block turn dispatch indefinitely.
     const COMPOSIO_FETCH_TIMEOUT_SECS: u64 = 3;
     let extra_tools = if !definition.subagents.is_empty() {
         let connected = match tokio::time::timeout(
@@ -593,6 +464,7 @@ mod scoping_tests {
             skill_filter: None,
             extra_tools: vec![],
             max_iterations: 8,
+            iteration_policy: Default::default(),
             max_result_chars: None,
             timeout_secs: None,
             sandbox_mode: SandboxMode::None,
@@ -618,18 +490,18 @@ mod scoping_tests {
     }
 
     /// `ToolScope::Named` with no extras returns exactly the named set.
-    /// This is the welcome agent's path: 2 tools in TOML, no
-    /// delegation, no extras → 2 entries in the visibility whitelist.
+    /// For agents with a narrow tool scope (e.g. 2 tools in TOML,
+    /// no delegation, no extras) → 2 entries in the visibility whitelist.
     #[test]
     fn named_scope_without_extras_returns_named_only() {
         let def = def_with_scope(ToolScope::Named(vec![
-            "complete_onboarding".into(),
             "memory_recall".into(),
+            "ask_user_clarification".into(),
         ]));
         let set = build_visible_tool_set(&def, &[]).expect("named scope yields Some");
         assert_eq!(set.len(), 2);
-        assert!(set.contains("complete_onboarding"));
         assert!(set.contains("memory_recall"));
+        assert!(set.contains("ask_user_clarification"));
     }
 
     /// `ToolScope::Named` with extras returns the union of the TOML
@@ -683,9 +555,7 @@ mod scoping_tests {
     /// effectively "no tools visible". The prompt loop's `is_visible`
     /// helper treats `Some(empty)` differently from `None`: the former
     /// means "filter active, nothing matches" so the LLM gets an empty
-    /// tool list, while the latter means "no filter at all". This is
-    /// the welcome agent's emergency fallback if its TOML somehow
-    /// shipped without any tools.
+    /// tool list, while the latter means "no filter at all".
     #[test]
     fn empty_named_with_no_extras_returns_empty_set() {
         let def = def_with_scope(ToolScope::Named(vec![]));
@@ -726,6 +596,130 @@ mod scoping_tests {
     }
 }
 
+#[cfg(test)]
+mod approval_surface_gating_tests {
+    use super::channel_has_approval_surface;
+
+    // Sub-issue 2 of #3098: this gate is what decides whether the dispatch
+    // loop sets an `ApprovalChatContext` (→ gate fires for `Prompt`-class
+    // tools) versus the legacy bypass (→ tool calls silently allowed).
+    // Pin the matrix so silently broadening to a new channel can't
+    // accidentally TTL-deny every parked tool call there.
+
+    #[test]
+    fn telegram_has_approval_surface() {
+        assert!(channel_has_approval_surface("telegram"));
+    }
+
+    #[test]
+    fn other_channels_do_not_yet_have_an_approval_surface() {
+        for channel in ["discord", "slack", "imessage", "mattermost", "web", "irc"] {
+            assert!(
+                !channel_has_approval_surface(channel),
+                "channel {channel:?} is not (yet) wired to a per-channel approval surface; \
+                 the dispatch loop must not scope an ApprovalChatContext for it or every \
+                 Prompt-class tool call will park with nobody to answer and TTL-deny"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_channel_does_not_have_approval_surface() {
+        assert!(!channel_has_approval_surface(""));
+        assert!(!channel_has_approval_surface("Telegram")); // case-sensitive on purpose
+        assert!(!channel_has_approval_surface("telegram-bot"));
+    }
+}
+
+#[cfg(any(test, debug_assertions))]
+pub mod test_support {
+    //! Debug-build seams for raw integration coverage of dispatch helpers.
+
+    use super::*;
+
+    pub fn build_channel_context_block_for_test(msg: &traits::ChannelMessage) -> String {
+        build_channel_context_block(msg)
+    }
+
+    pub fn select_acknowledgment_reaction_for_test(content: &str) -> &'static str {
+        select_acknowledgment_reaction(content)
+    }
+}
+
+/// Whether a channel currently has a registered approval surface — i.e.
+/// a subscriber that turns `ApprovalRequested` events into chat messages
+/// and a way for the user's reply to flow back into the
+/// [`ApprovalGate`]. When `true`, the dispatch loop scopes the agent
+/// turn in an [`ApprovalChatContext`] so the gate actually fires for
+/// `Prompt`-class tools and intercepts yes/no replies for parked
+/// approvals.
+///
+/// Only Telegram has a surface today (sub-issue 2 of #3098). Discord /
+/// Slack / iMessage / Mattermost remain in the legacy "no chat context
+/// → silently allow" state until each gets a per-channel surface in a
+/// follow-up PR; surfacing approvals there without a subscriber would
+/// just TTL-deny every parked call, which is worse than the status quo.
+///
+/// [`ApprovalChatContext`]: crate::openhuman::approval::ApprovalChatContext
+/// [`ApprovalGate`]: crate::openhuman::approval::ApprovalGate
+pub(crate) fn channel_has_approval_surface(channel: &str) -> bool {
+    channel == TELEGRAM_APPROVAL_CLIENT_ID
+}
+
+/// If the inbound message is a yes/no reply for a parked approval on
+/// this thread, route it to [`ApprovalGate::decide`] and return `true`.
+/// Otherwise return `false` so the caller can dispatch the message as a
+/// fresh turn (which intentionally cancels any parked approval — the
+/// user is redirecting). Mirrors the web channel intercept at
+/// `channels/providers/web.rs:493-525`.
+///
+/// [`ApprovalGate::decide`]: crate::openhuman::approval::ApprovalGate::decide
+async fn try_route_approval_reply(msg: &traits::ChannelMessage) -> bool {
+    let Some(gate) = crate::openhuman::approval::ApprovalGate::try_global() else {
+        return false;
+    };
+    let thread_id = conversation_history_key(msg);
+    let Some(request_id) = gate.pending_for_thread(&thread_id) else {
+        return false;
+    };
+    let Some(decision) = crate::openhuman::approval::parse_approval_reply(&msg.content) else {
+        return false;
+    };
+    match gate.decide(&request_id, decision) {
+        Ok(Some(_)) => {
+            tracing::info!(
+                "[dispatch] routed chat reply to approval gate channel={} thread_id={} request_id={} decision={}",
+                msg.channel,
+                thread_id,
+                request_id,
+                decision.as_str()
+            );
+            true
+        }
+        Ok(None) => {
+            // The request was already decided / cleared between our
+            // `pending_for_thread` check and `decide`. Don't claim the
+            // intercept; fall through so the reply lands as a normal turn.
+            tracing::warn!(
+                "[dispatch] approval reply targeted a non-pending request channel={} thread_id={} request_id={} — dispatching as fresh turn",
+                msg.channel,
+                thread_id,
+                request_id
+            );
+            false
+        }
+        Err(err) => {
+            tracing::warn!(
+                "[dispatch] approval gate decide failed channel={} thread_id={} request_id={}: {err}",
+                msg.channel,
+                thread_id,
+                request_id
+            );
+            false
+        }
+    }
+}
+
 pub(crate) async fn process_channel_message(
     ctx: Arc<ChannelRuntimeContext>,
     msg: traits::ChannelMessage,
@@ -744,11 +738,24 @@ pub(crate) async fn process_channel_message(
         reply_target: msg.reply_target.clone(),
         content: msg.content.clone(),
         thread_ts: msg.thread_ts.clone(),
+        workspace_dir: ctx.workspace_dir.as_ref().clone(),
     });
 
     let target_channel = ctx.channels_by_name.get(&msg.channel).cloned();
     if handle_runtime_command_if_needed(ctx.as_ref(), &msg, target_channel.as_ref()).await {
         return;
+    }
+
+    // Sub-issue 2 of #3098: if this channel has an approval surface and the
+    // inbound message is a yes/no reply for a parked approval on this same
+    // history key, route it to `ApprovalGate::decide` and return — running
+    // a fresh agent turn would cancel the parked tool call. Any other text
+    // falls through to the normal dispatch (the user is redirecting). Mirrors
+    // the same intercept in `channels/providers/web.rs:493-525`.
+    if channel_has_approval_surface(&msg.channel) {
+        if try_route_approval_reply(&msg).await {
+            return;
+        }
     }
 
     // Fire typing indicator as early as possible — before any async I/O — so the
@@ -982,30 +989,24 @@ pub(crate) async fn process_channel_message(
     // The agent handler owns the history vector — we `mem::take` the
     // local one to avoid an unnecessary clone; `history` is not read
     // again below.
-    // Pick the active agent for this turn (welcome pre-onboarding,
-    // orchestrator post) and synthesise its delegation tool surface.
-    // Fresh disk read of `Config::onboarding_completed` happens inside
-    // `resolve_target_agent` — see the `[dispatch::routing]` traces.
+    // Pick the active agent for this turn (always orchestrator) and
+    // synthesise its delegation tool surface. Fresh disk read of
+    // `Config::onboarding_completed` happens inside `resolve_target_agent`.
     let scoping = resolve_target_agent(&msg.channel).await;
 
-    // When routing to the welcome agent, inject up-to-date Composio connection
-    // state into the last user message so the agent always knows which
-    // integrations are live without burning a tool call to check. The block is
-    // appended — not prepended — so it does not interfere with memory context
-    // that was already prepended to `enriched_message`. Scoped strictly to the
-    // welcome agent: orchestrator turns are not annotated.
-    if scoping.target_agent_id.as_deref() == Some("welcome") {
-        let conn_block = build_connection_state_block().await;
-        if !conn_block.is_empty() {
-            if let Some(last_user_msg) = history.iter_mut().rev().find(|m| m.role == "user") {
-                last_user_msg.content.push_str(&conn_block);
-                tracing::debug!(
-                    block_chars = conn_block.len(),
-                    "[dispatch::connection_state] appended CONNECTION_STATE block to welcome-agent turn"
-                );
-            }
+    // A channel's explicitly-registered `tools_registry` tools are always visible
+    // to the model. The resolved agent's visible-tool scope is meant to filter the
+    // ambient/builtin tool surface, not to hide tools the channel deliberately
+    // handed in for this turn. Without this, a channel that provides a tool
+    // outside the resolved agent's `Named` scope (e.g. a test mock, or a custom
+    // channel-specific tool) would be filtered out and surfaced to the model as
+    // "unknown tool". When the scope is `Wildcard` (`None`), no filter applies.
+    let visible_tool_names = scoping.visible_tool_names.map(|mut set| {
+        for tool in ctx.tools_registry.iter() {
+            set.insert(tool.name().to_string());
         }
-    }
+        set
+    });
 
     let turn_request = AgentTurnRequest {
         provider: Arc::clone(&active_provider),
@@ -1017,10 +1018,26 @@ pub(crate) async fn process_channel_message(
         silent: true,
         channel_name: msg.channel.clone(),
         multimodal: ctx.multimodal.clone(),
+        // Channel-sourced text is untrusted (Slack / Discord / Telegram
+        // / WhatsApp / etc. — anyone who can DM the bot can put bytes
+        // here). Operator-supplied defaults at `config.multimodal_files`
+        // would otherwise let a remote sender smuggle a marker like
+        // `[FILE:/etc/passwd]`, `[FILE:/home/<user>/.ssh/id_rsa]`, or
+        // `[FILE:.env]` into the agent prompt — `read_local_file`
+        // resolves the path with no workspace confinement, so absolute
+        // paths exfiltrate server-local files via a follow-up question.
+        //
+        // Hard-disable file-marker resolution on this path regardless of
+        // operator config; the desktop / web-chat path (where the user
+        // owns the local filesystem) goes through a different turn
+        // builder and keeps the operator default. Mirrors the triage-arm
+        // hardening in `agent::triage::evaluator`.
+        multimodal_files:
+            crate::openhuman::config::MultimodalFileConfig::for_untrusted_channel_input(),
         max_tool_iterations: ctx.max_tool_iterations,
         on_delta: None, // on_progress handles text deltas now
         target_agent_id: scoping.target_agent_id,
-        visible_tool_names: scoping.visible_tool_names,
+        visible_tool_names,
         extra_tools: scoping.extra_tools,
         on_progress: progress_tx,
     };
@@ -1030,7 +1047,7 @@ pub(crate) async fn process_channel_message(
         model = %route.model,
         "[channels::dispatch] dispatching {AGENT_RUN_TURN_METHOD} via native bus"
     );
-    let llm_result = tokio::time::timeout(Duration::from_secs(ctx.message_timeout_secs), async {
+    let agent_call = async {
         request_native_global::<AgentTurnRequest, AgentTurnResponse>(
             AGENT_RUN_TURN_METHOD,
             turn_request,
@@ -1052,6 +1069,27 @@ pub(crate) async fn process_channel_message(
             // startup wiring bugs are immediately obvious in logs.
             other => anyhow::anyhow!("[agent.run_turn dispatch] {other}"),
         })
+    };
+    // Sub-issue 2 of #3098: scope the agent turn in an `ApprovalChatContext`
+    // for channels that have a registered approval surface — currently
+    // Telegram only via `TelegramApprovalSurfaceSubscriber`. Without this
+    // scope the gate's "no chat context → allow straight through" branch
+    // (`approval/gate.rs:219-231`) silently bypasses every `Prompt`-class
+    // tool call, voiding the `supervised` autonomy tier on the channel.
+    // Discord / Slack / iMessage / Mattermost stay in the legacy bypass
+    // until each gets its own approval surface in a follow-up PR.
+    let llm_result = tokio::time::timeout(Duration::from_secs(ctx.message_timeout_secs), async {
+        if channel_has_approval_surface(&msg.channel) {
+            let approval_ctx = crate::openhuman::approval::ApprovalChatContext {
+                thread_id: history_key.clone(),
+                client_id: msg.channel.clone(),
+            };
+            crate::openhuman::approval::APPROVAL_CHAT_CONTEXT
+                .scope(approval_ctx, agent_call)
+                .await
+        } else {
+            agent_call.await
+        }
     })
     .await;
 
@@ -1162,6 +1200,7 @@ pub(crate) async fn process_channel_message(
                     response: error_text.to_string(),
                     elapsed_ms: started_at.elapsed().as_millis() as u64,
                     success: false,
+                    workspace_dir: ctx.workspace_dir.as_ref().clone(),
                 });
                 return;
             }
@@ -1290,6 +1329,7 @@ pub(crate) async fn process_channel_message(
         response: response_text,
         elapsed_ms: started_at.elapsed().as_millis() as u64,
         success,
+        workspace_dir: ctx.workspace_dir.as_ref().clone(),
     });
 }
 
@@ -1324,165 +1364,5 @@ pub(crate) async fn run_message_dispatch_loop(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn contains_any_hits_at_least_one_word() {
-        assert!(contains_any("hello world", &["world"]));
-        assert!(contains_any("hello world", &["not there", "world"]));
-    }
-
-    #[test]
-    fn contains_any_returns_false_when_none_match() {
-        assert!(!contains_any("hello world", &["nope"]));
-        assert!(!contains_any("hello world", &[]));
-    }
-
-    #[test]
-    fn starts_with_any_detects_leading_prefix() {
-        assert!(starts_with_any("hello world", &["hello"]));
-        assert!(starts_with_any("hey you", &["yo", "hey"]));
-    }
-
-    #[test]
-    fn starts_with_any_returns_false_when_none_match() {
-        assert!(!starts_with_any("bonjour", &["hello", "hey"]));
-        assert!(!starts_with_any("x", &[]));
-    }
-
-    // ── select_acknowledgment_reaction ────────────────────────────
-
-    fn is_in(emoji: &str, options: &[&str]) -> bool {
-        options.contains(&emoji)
-    }
-
-    #[test]
-    fn ack_reaction_gratitude_category() {
-        for msg in ["thanks a lot", "Thank you", "THX friend", "I appreciate it"] {
-            let r = select_acknowledgment_reaction(msg);
-            assert!(is_in(r, &["❤️", "🙏"]), "`{msg}` → {r}");
-        }
-    }
-
-    #[test]
-    fn ack_reaction_celebration_category() {
-        for msg in ["amazing job", "this is awesome", "incredible!!"] {
-            let r = select_acknowledgment_reaction(msg);
-            assert!(is_in(r, &["🔥", "🎉"]), "`{msg}` → {r}");
-        }
-    }
-
-    #[test]
-    fn ack_reaction_crypto_category() {
-        for msg in ["BTC price today", "ETH pump", "gm on the defi timeline"] {
-            let r = select_acknowledgment_reaction(msg);
-            assert!(is_in(r, &["💯", "⚡"]), "`{msg}` → {r}");
-        }
-    }
-
-    #[test]
-    fn ack_reaction_technical_category() {
-        for msg in ["deploy the api", "debug this code", "rust question"] {
-            let r = select_acknowledgment_reaction(msg);
-            assert!(is_in(r, &["👨‍💻", "🤓"]), "`{msg}` → {r}");
-        }
-    }
-
-    #[test]
-    fn ack_reaction_greeting_category() {
-        for msg in ["hi there", "hello", "hey friend", "yo"] {
-            let r = select_acknowledgment_reaction(msg);
-            assert!(is_in(r, &["🤗", "😁"]), "`{msg}` → {r}");
-        }
-    }
-
-    #[test]
-    fn ack_reaction_question_category() {
-        for msg in [
-            "what is this?",
-            "how does it work",
-            "can you help",
-            "is this correct",
-        ] {
-            let r = select_acknowledgment_reaction(msg);
-            assert!(is_in(r, &["🤔", "✍️"]), "`{msg}` → {r}");
-        }
-    }
-
-    #[test]
-    fn ack_reaction_default_category() {
-        let r = select_acknowledgment_reaction("the task is running");
-        assert!(is_in(r, &["👀", "✍️"]));
-    }
-
-    #[test]
-    fn ack_reaction_is_deterministic() {
-        let a = select_acknowledgment_reaction("thanks");
-        let b = select_acknowledgment_reaction("thanks");
-        assert_eq!(a, b, "same input should always yield same reaction");
-    }
-
-    #[test]
-    fn ack_reaction_handles_empty_input_without_panic() {
-        // `content.chars().next()` is None on empty input — must not panic.
-        let r = select_acknowledgment_reaction("");
-        assert!(!r.is_empty());
-    }
-
-    #[test]
-    fn ack_reaction_handles_single_char() {
-        let r = select_acknowledgment_reaction("?");
-        // Single "?" falls into question category (contains '?').
-        assert!(is_in(r, &["🤔", "✍️"]));
-    }
-
-    // ── build_channel_context_block (#928) ───────────────────────
-
-    fn cm(channel: &str, reply_target: &str) -> traits::ChannelMessage {
-        traits::ChannelMessage {
-            channel: channel.into(),
-            sender: "alice".into(),
-            content: "hi".into(),
-            id: "m1".into(),
-            reply_target: reply_target.into(),
-            thread_ts: None,
-            timestamp: 0,
-        }
-    }
-
-    #[test]
-    fn channel_context_block_omitted_for_web_and_cli() {
-        assert!(build_channel_context_block(&cm("web", "1")).is_empty());
-        assert!(build_channel_context_block(&cm("cli", "1")).is_empty());
-        assert!(build_channel_context_block(&cm("WEB", "1")).is_empty());
-        assert!(build_channel_context_block(&cm("", "1")).is_empty());
-    }
-
-    #[test]
-    fn channel_context_block_omitted_when_reply_target_missing() {
-        assert!(build_channel_context_block(&cm("telegram", "")).is_empty());
-        assert!(build_channel_context_block(&cm("telegram", "   ")).is_empty());
-    }
-
-    #[test]
-    fn channel_context_block_for_telegram_includes_routing_hint() {
-        let block = build_channel_context_block(&cm("telegram", "123456"));
-        assert!(block.contains("[Channel context]"));
-        assert!(block.contains("\"telegram\""));
-        assert!(block.contains("\"123456\""));
-        // Hint must steer the model toward announce mode with the same channel/target.
-        assert!(block.contains("announce"));
-        assert!(block.contains("cron_add"));
-    }
-
-    #[test]
-    fn channel_context_block_for_discord_and_slack_share_shape() {
-        for ch in ["discord", "slack", "matrix"] {
-            let block = build_channel_context_block(&cm(ch, "chan-42"));
-            assert!(block.contains(ch), "missing channel name in `{ch}` block");
-            assert!(block.contains("chan-42"));
-            assert!(block.contains("announce"));
-        }
-    }
-}
+#[path = "dispatch_tests.rs"]
+mod tests;

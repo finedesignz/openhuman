@@ -1,4 +1,4 @@
-use serde::de::DeserializeOwned;
+use serde::de::{DeserializeOwned, Deserializer};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
@@ -122,6 +122,18 @@ struct MeetSettingsUpdate {
 }
 
 #[derive(Debug, Deserialize)]
+struct SearchSettingsUpdate {
+    engine: Option<String>,
+    max_results: Option<usize>,
+    timeout_secs: Option<u64>,
+    parallel_api_key: Option<String>,
+    brave_api_key: Option<String>,
+    querit_api_key: Option<String>,
+    allowed_domains: Option<Vec<String>>,
+    allow_all: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
 struct LocalAiSettingsUpdate {
     runtime_enabled: Option<bool>,
     /// MVP opt-in marker. Tied to `runtime_enabled` from the unified AI
@@ -130,7 +142,8 @@ struct LocalAiSettingsUpdate {
     /// having to also apply a tier preset.
     opt_in_confirmed: Option<bool>,
     provider: Option<String>,
-    base_url: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_present_json")]
+    base_url: Option<Value>,
     model_id: Option<String>,
     chat_model_id: Option<String>,
     usage_embeddings: Option<bool>,
@@ -187,6 +200,40 @@ struct ComposioTriggerSettingsUpdate {
     triage_disabled_toolkits: Option<Vec<String>>,
 }
 
+#[derive(Debug, Deserialize)]
+struct AutonomySettingsUpdate {
+    /// `"readonly" | "supervised" | "full"` (case-insensitive).
+    level: Option<String>,
+    workspace_only: Option<bool>,
+    /// Replaces the shell command allow-list wholesale.
+    allowed_commands: Option<Vec<String>>,
+    /// Replaces the forbidden-paths denylist wholesale.
+    forbidden_paths: Option<Vec<String>>,
+    /// Replaces the trusted-roots allow-list wholesale. Each entry is
+    /// `{ "path": "/abs/dir", "access": "read" | "readwrite" }`.
+    trusted_roots: Option<Vec<crate::openhuman::security::TrustedRoot>>,
+    allow_tool_install: Option<bool>,
+    // Accept u64 to match the published schema (`TypeSchema::U64`); clamped to the
+    // internal u32 at apply time. u32::MAX/hr is already effectively unlimited.
+    max_actions_per_hour: Option<u64>,
+    /// Replaces the "Always allow" allowlist wholesale — tool names the agent
+    /// may run without an approval prompt. Empty list clears it.
+    auto_approve: Option<Vec<String>>,
+    require_task_plan_approval: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentSettingsUpdate {
+    /// Tool/action wall-clock timeout in seconds (1–3600). Validated server-side.
+    agent_timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ActivityLevelSettingsUpdate {
+    /// "off" | "minimal" | "moderate" | "active" | "always_on" (or "0"-"4").
+    level: Option<String>,
+}
+
 pub fn all_controller_schemas() -> Vec<ControllerSchema> {
     vec![
         schemas("get_config"),
@@ -204,6 +251,7 @@ pub fn all_controller_schemas() -> Vec<ControllerSchema> {
         schemas("workspace_onboarding_flag_set"),
         schemas("update_analytics_settings"),
         schemas("get_analytics_settings"),
+        schemas("get_dashboard_settings"),
         schemas("update_meet_settings"),
         schemas("get_meet_settings"),
         schemas("agent_server_status"),
@@ -217,6 +265,14 @@ pub fn all_controller_schemas() -> Vec<ControllerSchema> {
         schemas("update_voice_server_settings"),
         schemas("update_composio_trigger_settings"),
         schemas("get_composio_trigger_settings"),
+        schemas("get_autonomy_settings"),
+        schemas("update_autonomy_settings"),
+        schemas("get_agent_settings"),
+        schemas("update_agent_settings"),
+        schemas("update_search_settings"),
+        schemas("get_search_settings"),
+        schemas("get_activity_level_settings"),
+        schemas("update_activity_level_settings"),
     ]
 }
 
@@ -283,6 +339,10 @@ pub fn all_registered_controllers() -> Vec<RegisteredController> {
             handler: handle_get_analytics_settings,
         },
         RegisteredController {
+            schema: schemas("get_dashboard_settings"),
+            handler: handle_get_dashboard_settings,
+        },
+        RegisteredController {
             schema: schemas("update_meet_settings"),
             handler: handle_update_meet_settings,
         },
@@ -333,6 +393,38 @@ pub fn all_registered_controllers() -> Vec<RegisteredController> {
         RegisteredController {
             schema: schemas("get_composio_trigger_settings"),
             handler: handle_get_composio_trigger_settings,
+        },
+        RegisteredController {
+            schema: schemas("get_autonomy_settings"),
+            handler: handle_get_autonomy_settings,
+        },
+        RegisteredController {
+            schema: schemas("update_autonomy_settings"),
+            handler: handle_update_autonomy_settings,
+        },
+        RegisteredController {
+            schema: schemas("get_agent_settings"),
+            handler: handle_get_agent_settings,
+        },
+        RegisteredController {
+            schema: schemas("update_agent_settings"),
+            handler: handle_update_agent_settings,
+        },
+        RegisteredController {
+            schema: schemas("update_search_settings"),
+            handler: handle_update_search_settings,
+        },
+        RegisteredController {
+            schema: schemas("get_search_settings"),
+            handler: handle_get_search_settings,
+        },
+        RegisteredController {
+            schema: schemas("get_activity_level_settings"),
+            handler: handle_get_activity_level_settings,
+        },
+        RegisteredController {
+            schema: schemas("update_activity_level_settings"),
+            handler: handle_update_activity_level_settings,
         },
     ]
 }
@@ -512,6 +604,77 @@ pub fn schemas(function: &str) -> ControllerSchema {
             ],
             outputs: vec![json_output("snapshot", "Updated config snapshot.")],
         },
+        "get_autonomy_settings" => ControllerSchema {
+            namespace: "config",
+            function: "get_autonomy_settings",
+            description: "Get the agent access-mode settings (autonomy level, workspace confinement, trusted roots, command allow-list, forbidden paths).",
+            inputs: vec![],
+            outputs: vec![json_output("autonomy", "Current [autonomy] config block.")],
+        },
+        "update_autonomy_settings" => ControllerSchema {
+            namespace: "config",
+            function: "update_autonomy_settings",
+            description: "Update the agent access mode: autonomy level, workspace confinement, trusted-roots allow-list, command allow-list, forbidden paths, and OS-install permission. Applies live to active sessions.",
+            inputs: vec![
+                optional_string("level", "Autonomy level: readonly | supervised | full."),
+                optional_bool("workspace_only", "Confine file/path access to the workspace directory."),
+                FieldSchema {
+                    name: "allowed_commands",
+                    ty: TypeSchema::Option(Box::new(TypeSchema::Array(Box::new(TypeSchema::String)))),
+                    comment: "Replace the shell command allow-list (array of base command names).",
+                    required: false,
+                },
+                FieldSchema {
+                    name: "forbidden_paths",
+                    ty: TypeSchema::Option(Box::new(TypeSchema::Array(Box::new(TypeSchema::String)))),
+                    comment: "Replace the forbidden-paths denylist (array of path prefixes).",
+                    required: false,
+                },
+                FieldSchema {
+                    name: "trusted_roots",
+                    ty: TypeSchema::Option(Box::new(TypeSchema::Json)),
+                    comment: "Replace the trusted-roots allow-list: array of {path, access: read|readwrite}. Grants access outside the workspace; credential dirs (~/.ssh, ~/.gnupg, ~/.aws) stay blocked regardless.",
+                    required: false,
+                },
+                optional_bool("allow_tool_install", "Allow the agent to install OS packages via install_tool (intended for Full mode)."),
+                FieldSchema {
+                    name: "max_actions_per_hour",
+                    ty: TypeSchema::Option(Box::new(TypeSchema::U64)),
+                    comment: "Rate limit for side-effecting actions per hour.",
+                    required: false,
+                },
+                FieldSchema {
+                    name: "auto_approve",
+                    ty: TypeSchema::Option(Box::new(TypeSchema::Array(Box::new(TypeSchema::String)))),
+                    comment: "Replace the \"Always allow\" allowlist (array of tool names the agent runs without an approval prompt). Empty array clears it.",
+                    required: false,
+                },
+                optional_bool("require_task_plan_approval", "Require approval before an agent executes a task-board plan."),
+            ],
+            outputs: vec![json_output("snapshot", "Updated config snapshot.")],
+        },
+        "get_agent_settings" => ControllerSchema {
+            namespace: "config",
+            function: "get_agent_settings",
+            description: "Read agent execution settings: the action/tool wall-clock timeout, the runtime-effective value, and whether the OPENHUMAN_TOOL_TIMEOUT_SECS env var overrides it.",
+            inputs: vec![],
+            outputs: vec![json_output(
+                "settings",
+                "Agent settings: agent_timeout_secs, effective_timeout_secs, env_override, min_timeout_secs, max_timeout_secs.",
+            )],
+        },
+        "update_agent_settings" => ControllerSchema {
+            namespace: "config",
+            function: "update_agent_settings",
+            description: "Update agent execution settings. Currently the action/tool wall-clock timeout (seconds). Applies to the next tool call without a restart; the OPENHUMAN_TOOL_TIMEOUT_SECS env var still overrides it when set.",
+            inputs: vec![FieldSchema {
+                name: "agent_timeout_secs",
+                ty: TypeSchema::Option(Box::new(TypeSchema::U64)),
+                comment: "Wall-clock timeout for a single tool/action execution, in seconds (1–3600). Extend this when large local models are interrupted before finishing.",
+                required: false,
+            }],
+            outputs: vec![json_output("snapshot", "Updated config snapshot.")],
+        },
         "update_browser_settings" => ControllerSchema {
             namespace: "config",
             function: "update_browser_settings",
@@ -539,9 +702,9 @@ pub fn schemas(function: &str) -> ControllerSchema {
                     "provider",
                     "Local provider identifier. Supported values: ollama, lm_studio.",
                 ),
-                optional_string(
+                optional_json(
                     "base_url",
-                    "Provider base URL. For LM Studio this defaults to http://localhost:1234/v1.",
+                    "Provider base URL string, or null to clear. For LM Studio this defaults to http://localhost:1234/v1.",
                 ),
                 optional_string("model_id", "Default local chat model identifier."),
                 optional_string("chat_model_id", "Local chat model identifier."),
@@ -669,6 +832,18 @@ pub fn schemas(function: &str) -> ControllerSchema {
                 required: true,
             }],
         },
+        "get_dashboard_settings" => ControllerSchema {
+            namespace: "config",
+            function: "get_dashboard_settings",
+            description: "Read dashboard settings, including the local architecture diagram viewer.",
+            inputs: vec![],
+            outputs: vec![FieldSchema {
+                name: "dashboard",
+                ty: TypeSchema::Json,
+                comment: "Current [dashboard] config block.",
+                required: true,
+            }],
+        },
         "update_meet_settings" => ControllerSchema {
             namespace: "config",
             function: "update_meet_settings",
@@ -691,6 +866,81 @@ pub fn schemas(function: &str) -> ControllerSchema {
                 comment: "Whether the orchestrator handoff fires on Meet call end.",
                 required: true,
             }],
+        },
+        "update_search_settings" => ControllerSchema {
+            namespace: "config",
+            function: "update_search_settings",
+            description: "Update search engine selection and BYO API credentials.",
+            inputs: vec![
+                optional_string(
+                    "engine",
+                    "Active engine: managed | parallel | brave | querit.",
+                ),
+                FieldSchema {
+                    name: "max_results",
+                    ty: TypeSchema::Option(Box::new(TypeSchema::U64)),
+                    comment: "Maximum results per query (1-20).",
+                    required: false,
+                },
+                FieldSchema {
+                    name: "timeout_secs",
+                    ty: TypeSchema::Option(Box::new(TypeSchema::U64)),
+                    comment: "Per-request timeout in seconds (1-120).",
+                    required: false,
+                },
+                optional_string(
+                    "parallel_api_key",
+                    "Parallel API key (empty string clears the stored key).",
+                ),
+                optional_string(
+                    "brave_api_key",
+                    "Brave Search API key (empty string clears the stored key).",
+                ),
+                optional_string(
+                    "querit_api_key",
+                    "Querit API key (empty string clears the stored key).",
+                ),
+                FieldSchema {
+                    name: "allowed_domains",
+                    ty: TypeSchema::Option(Box::new(TypeSchema::Array(Box::new(
+                        TypeSchema::String,
+                    )))),
+                    comment: "Websites the assistant may open/read (web_fetch/curl). Exact hosts match their subdomains; \"*\" allows all public sites; empty blocks all web access.",
+                    required: false,
+                },
+                FieldSchema {
+                    name: "allow_all",
+                    ty: TypeSchema::Option(Box::new(TypeSchema::Bool)),
+                    comment: "\"Allow all sites\" toggle. true sets the allowlist to [\"*\"]; false drops the wildcard, keeping explicit hosts.",
+                    required: false,
+                },
+            ],
+            outputs: vec![json_output("snapshot", "Updated config snapshot.")],
+        },
+        "get_search_settings" => ControllerSchema {
+            namespace: "config",
+            function: "get_search_settings",
+            description:
+                "Read search engine settings. API keys are surfaced as presence booleans only.",
+            inputs: vec![],
+            outputs: vec![json_output(
+                "settings",
+                "Engine, effective engine, limits, and per-provider configuration flags.",
+            )],
+        },
+        "get_activity_level_settings" => ControllerSchema {
+            namespace: "config",
+            function: "get_activity_level_settings",
+            description: "Get the agent activity level (0–4) and its derived settings: sync cadence, heartbeat/subconscious toggles, token budget, estimated monthly cost.",
+            inputs: vec![],
+            outputs: vec![json_output("settings", "Activity level settings with cost estimates.")],
+        },
+        "update_activity_level_settings" => ControllerSchema {
+            namespace: "config",
+            function: "update_activity_level_settings",
+            description: "Set the agent activity level. Immediately updates the scheduler gate mode and persists the change.",
+            inputs: vec![optional_string("level", "Activity level: off | minimal | moderate | active | always_on (or 0–4).")],
+            outputs: vec![json_output("settings", "Updated activity level settings with cost estimates.")],
         },
         "agent_server_status" => ControllerSchema {
             namespace: "config",
@@ -910,20 +1160,40 @@ fn handle_update_model_settings(params: Map<String, Value>) -> ControllerFuture 
                         generate_provider_id, is_slug_reserved, migrate_legacy_fields, AuthStyle,
                         CloudProviderCreds,
                     };
+                    let reserved_count = entries
+                        .iter()
+                        .filter(|e| {
+                            let t = e.slug.trim();
+                            !t.is_empty() && is_slug_reserved(t)
+                        })
+                        .count();
+                    if reserved_count > 0 {
+                        log::debug!(
+                            "[config] update_model_settings: dropping {} reserved cloud provider slug(s)",
+                            reserved_count
+                        );
+                    }
                     entries
                         .into_iter()
+                        // Silently drop entries whose (non-empty) slug is reserved —
+                        // typically the migration-seeded "openhuman" / "cloud" /
+                        // "pid" built-ins that the frontend echoes back on every
+                        // save (see `migrations::unify_ai_provider_settings`).
+                        // Empty slugs still fall through so the explicit
+                        // validation error below fires for actual frontend
+                        // bugs. `apply_model_settings` re-injects the existing
+                        // reserved entries from the stored config so they
+                        // aren't dropped on save.
+                        .filter(|e| {
+                            let trimmed = e.slug.trim();
+                            trimmed.is_empty() || !is_slug_reserved(trimmed)
+                        })
                         .map(|e| {
                             let slug = e.slug.trim().to_string();
                             if slug.is_empty() {
                                 return Err(
                                     "cloud provider slug must not be empty".to_string()
                                 );
-                            }
-                            if is_slug_reserved(&slug) {
-                                return Err(format!(
-                                    "slug '{}' is reserved and cannot be used for a custom provider",
-                                    slug
-                                ));
                             }
                             let auth_style = match e
                                 .auth_style
@@ -1027,6 +1297,72 @@ fn handle_update_runtime_settings(params: Map<String, Value>) -> ControllerFutur
     })
 }
 
+fn handle_get_autonomy_settings(_params: Map<String, Value>) -> ControllerFuture {
+    Box::pin(async move { to_json(config_rpc::get_autonomy_settings().await?) })
+}
+
+fn handle_update_autonomy_settings(params: Map<String, Value>) -> ControllerFuture {
+    Box::pin(async move {
+        let update = deserialize_params::<AutonomySettingsUpdate>(params)?;
+        let patch = config_rpc::AutonomySettingsPatch {
+            level: update.level,
+            workspace_only: update.workspace_only,
+            allowed_commands: update.allowed_commands,
+            forbidden_paths: update.forbidden_paths,
+            trusted_roots: update.trusted_roots,
+            allow_tool_install: update.allow_tool_install,
+            max_actions_per_hour: update
+                .max_actions_per_hour
+                .map(|v| u32::try_from(v).unwrap_or(u32::MAX)),
+            auto_approve: update.auto_approve,
+            require_task_plan_approval: update.require_task_plan_approval,
+        };
+        to_json(config_rpc::load_and_apply_autonomy_settings(patch).await?)
+    })
+}
+
+fn handle_get_agent_settings(_params: Map<String, Value>) -> ControllerFuture {
+    Box::pin(async {
+        log::debug!("[config][rpc] get_agent_settings enter");
+        match config_rpc::get_agent_settings().await {
+            Ok(outcome) => {
+                log::debug!("[config][rpc] get_agent_settings ok");
+                to_json(outcome)
+            }
+            Err(err) => {
+                log::warn!("[config][rpc] get_agent_settings failed: {err}");
+                Err(err)
+            }
+        }
+    })
+}
+
+fn handle_update_agent_settings(params: Map<String, Value>) -> ControllerFuture {
+    Box::pin(async move {
+        log::debug!("[config][rpc] update_agent_settings enter");
+        let update = match deserialize_params::<AgentSettingsUpdate>(params) {
+            Ok(u) => u,
+            Err(err) => {
+                log::warn!("[config][rpc] update_agent_settings invalid params: {err}");
+                return Err(err);
+            }
+        };
+        let patch = config_rpc::AgentSettingsPatch {
+            agent_timeout_secs: update.agent_timeout_secs,
+        };
+        match config_rpc::load_and_apply_agent_settings(patch).await {
+            Ok(outcome) => {
+                log::debug!("[config][rpc] update_agent_settings ok");
+                to_json(outcome)
+            }
+            Err(err) => {
+                log::warn!("[config][rpc] update_agent_settings failed: {err}");
+                Err(err)
+            }
+        }
+    })
+}
+
 fn handle_update_browser_settings(params: Map<String, Value>) -> ControllerFuture {
     Box::pin(async move {
         let update = deserialize_params::<BrowserSettingsUpdate>(params)?;
@@ -1040,11 +1376,17 @@ fn handle_update_browser_settings(params: Map<String, Value>) -> ControllerFutur
 fn handle_update_local_ai_settings(params: Map<String, Value>) -> ControllerFuture {
     Box::pin(async move {
         let update = deserialize_params::<LocalAiSettingsUpdate>(params)?;
+        let base_url = match update.base_url {
+            None => None,
+            Some(Value::Null) => Some(None),
+            Some(Value::String(value)) => Some(Some(value)),
+            Some(_) => return Err("invalid params: base_url must be a string or null".to_string()),
+        };
         let patch = config_rpc::LocalAiSettingsPatch {
             runtime_enabled: update.runtime_enabled,
             opt_in_confirmed: update.opt_in_confirmed,
             provider: update.provider,
-            base_url: update.base_url,
+            base_url,
             model_id: update.model_id,
             chat_model_id: update.chat_model_id,
             usage_embeddings: update.usage_embeddings,
@@ -1119,6 +1461,10 @@ fn handle_get_analytics_settings(_params: Map<String, Value>) -> ControllerFutur
             vec!["analytics settings read".to_string()],
         ))
     })
+}
+
+fn handle_get_dashboard_settings(_params: Map<String, Value>) -> ControllerFuture {
+    Box::pin(async { to_json(config_rpc::get_dashboard_settings().await?) })
 }
 
 fn handle_update_meet_settings(params: Map<String, Value>) -> ControllerFuture {
@@ -1292,14 +1638,93 @@ fn handle_get_composio_trigger_settings(_params: Map<String, Value>) -> Controll
     })
 }
 
+fn handle_update_search_settings(params: Map<String, Value>) -> ControllerFuture {
+    Box::pin(async move {
+        log::debug!("[config][rpc] update_search_settings enter");
+        let update = match deserialize_params::<SearchSettingsUpdate>(params) {
+            Ok(u) => u,
+            Err(err) => {
+                log::warn!("[config][rpc] update_search_settings invalid params: {err}");
+                return Err(err);
+            }
+        };
+        let patch = config_rpc::SearchSettingsPatch {
+            engine: update.engine,
+            max_results: update.max_results,
+            timeout_secs: update.timeout_secs,
+            parallel_api_key: update.parallel_api_key,
+            brave_api_key: update.brave_api_key,
+            querit_api_key: update.querit_api_key,
+            allowed_domains: update.allowed_domains,
+            allow_all: update.allow_all,
+        };
+        match config_rpc::load_and_apply_search_settings(patch).await {
+            Ok(outcome) => {
+                log::debug!("[config][rpc] update_search_settings ok");
+                to_json(outcome)
+            }
+            Err(err) => {
+                log::warn!("[config][rpc] update_search_settings failed: {err}");
+                Err(err)
+            }
+        }
+    })
+}
+
+fn handle_get_search_settings(_params: Map<String, Value>) -> ControllerFuture {
+    Box::pin(async {
+        log::debug!("[config][rpc] get_search_settings enter");
+        match config_rpc::get_search_settings().await {
+            Ok(outcome) => {
+                log::debug!("[config][rpc] get_search_settings ok");
+                to_json(outcome)
+            }
+            Err(err) => {
+                log::warn!("[config][rpc] get_search_settings failed: {err}");
+                Err(err)
+            }
+        }
+    })
+}
+
+fn handle_get_activity_level_settings(_params: Map<String, Value>) -> ControllerFuture {
+    Box::pin(async move { to_json(config_rpc::get_activity_level_settings().await?) })
+}
+
+fn handle_update_activity_level_settings(params: Map<String, Value>) -> ControllerFuture {
+    Box::pin(async move {
+        let update = deserialize_params::<ActivityLevelSettingsUpdate>(params)?;
+        let patch = config_rpc::ActivityLevelSettingsPatch {
+            level: update.level,
+        };
+        to_json(config_rpc::load_and_apply_activity_level_settings(patch).await?)
+    })
+}
+
 fn deserialize_params<T: DeserializeOwned>(params: Map<String, Value>) -> Result<T, String> {
     serde_json::from_value(Value::Object(params)).map_err(|e| format!("invalid params: {e}"))
+}
+
+fn deserialize_present_json<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Value::deserialize(deserializer).map(Some)
 }
 
 fn optional_string(name: &'static str, comment: &'static str) -> FieldSchema {
     FieldSchema {
         name,
         ty: TypeSchema::Option(Box::new(TypeSchema::String)),
+        comment,
+        required: false,
+    }
+}
+
+fn optional_json(name: &'static str, comment: &'static str) -> FieldSchema {
+    FieldSchema {
+        name,
+        ty: TypeSchema::Option(Box::new(TypeSchema::Json)),
         comment,
         required: false,
     }

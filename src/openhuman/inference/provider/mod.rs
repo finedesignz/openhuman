@@ -5,6 +5,7 @@
 //! providers, HTTP endpoint) share a single domain root.
 
 pub mod billing_error;
+pub mod claude_agent_sdk;
 pub mod claude_code;
 pub mod compatible;
 pub mod compatible_dump;
@@ -13,6 +14,7 @@ pub mod compatible_stream;
 pub mod compatible_types;
 pub mod config_rejection;
 pub mod factory;
+mod openai_codex;
 pub mod openhuman_backend;
 pub mod ops;
 pub mod reliable;
@@ -29,6 +31,8 @@ pub use traits::{
 };
 
 pub use billing_error::is_budget_exhausted_message;
-pub use config_rejection::is_provider_config_rejection_message;
-pub use factory::{create_chat_provider, provider_for_role};
+pub use config_rejection::{
+    is_openai_compatible_unknown_model_message, is_provider_config_rejection_message,
+};
+pub use factory::{create_chat_provider, provider_for_role, BYOK_INCOMPLETE_SENTINEL};
 pub use ops::*;

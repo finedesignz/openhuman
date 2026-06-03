@@ -355,6 +355,84 @@ async fn apply_model_settings_updates_fields_and_persists_snapshot() {
 }
 
 #[tokio::test]
+async fn apply_search_settings_sets_and_clears_allowed_domains() {
+    let tmp = tempdir().unwrap();
+    let mut cfg = tmp_config(&tmp);
+
+    // Explicit host list is trimmed, blanks dropped, sorted + de-duped.
+    let patch = SearchSettingsPatch {
+        allowed_domains: Some(vec![
+            " reuters.com ".into(),
+            "reuters.com".into(),
+            String::new(),
+            "github.com".into(),
+        ]),
+        ..Default::default()
+    };
+    apply_search_settings(&mut cfg, patch).await.expect("apply");
+    assert_eq!(
+        cfg.http_request.allowed_domains,
+        vec!["github.com".to_string(), "reuters.com".to_string()]
+    );
+
+    // allow_all = true collapses the list to the wildcard.
+    let patch = SearchSettingsPatch {
+        allow_all: Some(true),
+        ..Default::default()
+    };
+    apply_search_settings(&mut cfg, patch).await.expect("apply");
+    assert_eq!(cfg.http_request.allowed_domains, vec!["*".to_string()]);
+
+    // allow_all = false drops the wildcard (explicit hosts only / blocked).
+    let patch = SearchSettingsPatch {
+        allow_all: Some(false),
+        ..Default::default()
+    };
+    apply_search_settings(&mut cfg, patch).await.expect("apply");
+    assert!(cfg.http_request.allowed_domains.is_empty());
+}
+
+#[tokio::test]
+async fn apply_search_settings_accepts_disabled_engine() {
+    let tmp = tempdir().unwrap();
+    let mut cfg = tmp_config(&tmp);
+
+    apply_search_settings(
+        &mut cfg,
+        SearchSettingsPatch {
+            engine: Some("disabled".to_string()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("apply disabled search engine");
+
+    assert_eq!(cfg.search.engine, "disabled");
+    assert_eq!(
+        cfg.search.effective_engine(),
+        crate::openhuman::config::SearchEngine::Disabled
+    );
+}
+
+#[tokio::test]
+async fn apply_search_settings_rejects_unknown_search_engine() {
+    let tmp = tempdir().unwrap();
+    let mut cfg = tmp_config(&tmp);
+
+    let err = apply_search_settings(
+        &mut cfg,
+        SearchSettingsPatch {
+            engine: Some("unknown".to_string()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect_err("unknown engine should be rejected");
+
+    assert!(err.contains("disabled/managed/parallel/brave/querit"));
+}
+
+#[tokio::test]
 async fn apply_model_settings_stores_api_key_and_clears_when_empty() {
     // #1342: custom OpenAI-compatible providers — api_key must round-trip
     // through `apply_model_settings` and clear when an empty string is sent.
@@ -472,6 +550,131 @@ async fn apply_model_settings_empty_strings_clear_optional_fields() {
 }
 
 #[tokio::test]
+async fn apply_model_settings_preserves_existing_reserved_slug_cloud_providers() {
+    // Sentry TAURI-RUST-5 regression. The migration
+    // `unify_ai_provider_settings` seeds an "openhuman"-slug entry into
+    // `cloud_providers`. The frontend echoes the full cloud_providers
+    // list back on every settings save, but the schema handlers filter
+    // out reserved-slug entries before passing them through. Without
+    // this preservation step the filtered patch would silently delete
+    // the built-in entry — losing the `primary_cloud` referent and
+    // breaking inference routing.
+    use crate::openhuman::config::schema::cloud_providers::{AuthStyle, CloudProviderCreds};
+
+    let tmp = tempdir().unwrap();
+    let mut cfg = tmp_config(&tmp);
+    // Simulate the post-migration state: a built-in "openhuman" entry plus
+    // a user-added custom provider.
+    cfg.cloud_providers = vec![
+        CloudProviderCreds {
+            id: "openhuman-builtin".into(),
+            slug: "openhuman".into(),
+            label: "OpenHuman".into(),
+            endpoint: "https://api.tinyhumans.ai".into(),
+            auth_style: AuthStyle::OpenhumanJwt,
+            default_model: Some("reasoning-v1".into()),
+            ..Default::default()
+        },
+        CloudProviderCreds {
+            id: "myopenai-1".into(),
+            slug: "myopenai".into(),
+            label: "My OpenAI".into(),
+            endpoint: "https://api.openai.com".into(),
+            auth_style: AuthStyle::Bearer,
+            default_model: Some("gpt-4o".into()),
+            ..Default::default()
+        },
+    ];
+
+    // The patch arrives from the schema handler with the "openhuman"
+    // entry already filtered out (the schema handler drops reserved
+    // slugs silently). Only the user's custom provider is present, with
+    // the user's edit applied.
+    let patch = ModelSettingsPatch {
+        cloud_providers: Some(vec![CloudProviderCreds {
+            id: "myopenai-1".into(),
+            slug: "myopenai".into(),
+            label: "My OpenAI (edited)".into(),
+            endpoint: "https://api.openai.com/v1".into(),
+            auth_style: AuthStyle::Bearer,
+            default_model: Some("gpt-4o-mini".into()),
+            ..Default::default()
+        }]),
+        ..Default::default()
+    };
+
+    let _ = apply_model_settings(&mut cfg, patch).await.expect("apply");
+
+    // The user's edit is applied.
+    let myopenai = cfg
+        .cloud_providers
+        .iter()
+        .find(|e| e.slug == "myopenai")
+        .expect("myopenai entry survives");
+    assert_eq!(myopenai.label, "My OpenAI (edited)");
+    assert_eq!(myopenai.default_model.as_deref(), Some("gpt-4o-mini"));
+
+    // And the built-in "openhuman" entry is still there.
+    let openhuman = cfg
+        .cloud_providers
+        .iter()
+        .find(|e| e.slug == "openhuman")
+        .expect("openhuman built-in must be preserved across saves");
+    assert_eq!(openhuman.id, "openhuman-builtin");
+    assert_eq!(openhuman.endpoint, "https://api.tinyhumans.ai");
+}
+
+#[tokio::test]
+async fn apply_model_settings_does_not_double_add_reserved_entries() {
+    // Defensive: if a caller bypasses the schema handler (CLI / tests) and
+    // includes a reserved-slug entry in the patch, the preservation logic
+    // must not double-add it.
+    use crate::openhuman::config::schema::cloud_providers::{AuthStyle, CloudProviderCreds};
+
+    let tmp = tempdir().unwrap();
+    let mut cfg = tmp_config(&tmp);
+    cfg.cloud_providers = vec![CloudProviderCreds {
+        id: "openhuman-stored".into(),
+        slug: "openhuman".into(),
+        label: "OpenHuman (stored)".into(),
+        endpoint: "https://api.tinyhumans.ai".into(),
+        auth_style: AuthStyle::OpenhumanJwt,
+        default_model: Some("reasoning-v1".into()),
+        ..Default::default()
+    }];
+
+    let patch = ModelSettingsPatch {
+        cloud_providers: Some(vec![CloudProviderCreds {
+            id: "openhuman-from-patch".into(),
+            slug: "openhuman".into(),
+            label: "OpenHuman (from patch)".into(),
+            endpoint: "https://api.tinyhumans.ai".into(),
+            auth_style: AuthStyle::OpenhumanJwt,
+            default_model: Some("reasoning-v1".into()),
+            ..Default::default()
+        }]),
+        ..Default::default()
+    };
+
+    let _ = apply_model_settings(&mut cfg, patch).await.expect("apply");
+
+    // Exactly one "openhuman" entry survives; the patch's version wins
+    // (since it was already in `providers` before preservation ran).
+    let count = cfg
+        .cloud_providers
+        .iter()
+        .filter(|e| e.slug == "openhuman")
+        .count();
+    assert_eq!(count, 1, "no duplicate reserved-slug entries");
+    let entry = cfg
+        .cloud_providers
+        .iter()
+        .find(|e| e.slug == "openhuman")
+        .unwrap();
+    assert_eq!(entry.id, "openhuman-from-patch");
+}
+
+#[tokio::test]
 async fn apply_memory_settings_updates_all_provided_fields() {
     let tmp = tempdir().unwrap();
     let mut cfg = tmp_config(&tmp);
@@ -493,6 +696,33 @@ async fn apply_memory_settings_updates_all_provided_fields() {
         cfg.agent.memory_window,
         Some(crate::openhuman::config::schema::MemoryContextWindow::Extended)
     );
+}
+
+#[tokio::test]
+async fn apply_autonomy_settings_updates_action_budget() {
+    let tmp = tempdir().unwrap();
+    let mut cfg = tmp_config(&tmp);
+    cfg.autonomy.max_actions_per_hour = 20;
+
+    let outcome = apply_autonomy_settings(
+        &mut cfg,
+        AutonomySettingsPatch {
+            max_actions_per_hour: Some(64),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("apply autonomy settings");
+
+    assert_eq!(cfg.autonomy.max_actions_per_hour, 64);
+    assert_eq!(
+        outcome.value["config"]["autonomy"]["max_actions_per_hour"],
+        serde_json::json!(64)
+    );
+    assert!(outcome
+        .logs
+        .iter()
+        .any(|l| l.contains("autonomy settings saved to")));
 }
 
 #[tokio::test]
@@ -572,7 +802,7 @@ async fn apply_local_ai_settings_updates_lm_studio_provider_fields() {
         runtime_enabled: Some(true),
         opt_in_confirmed: Some(true),
         provider: Some("lm-studio".into()),
-        base_url: Some(" http://localhost:1234/v1/ ".into()),
+        base_url: Some(Some(" http://localhost:1234/v1/ ".into())),
         model_id: Some(" local-default ".into()),
         chat_model_id: Some(" local-chat ".into()),
         usage_embeddings: Some(true),
@@ -590,7 +820,7 @@ async fn apply_local_ai_settings_updates_lm_studio_provider_fields() {
     assert_eq!(cfg.local_ai.provider, "lm_studio");
     assert_eq!(
         cfg.local_ai.base_url.as_deref(),
-        Some("http://localhost:1234/v1/")
+        Some("http://localhost:1234/v1")
     );
     assert_eq!(cfg.local_ai.model_id, "local-default");
     assert_eq!(cfg.local_ai.chat_model_id, "local-chat");
@@ -602,7 +832,7 @@ async fn apply_local_ai_settings_updates_lm_studio_provider_fields() {
 
     let clear_and_fallback = LocalAiSettingsPatch {
         provider: Some("unknown-provider".into()),
-        base_url: Some("   ".into()),
+        base_url: Some(Some("   ".into())),
         model_id: Some("   ".into()),
         chat_model_id: Some("".into()),
         ..LocalAiSettingsPatch::default()
@@ -615,6 +845,40 @@ async fn apply_local_ai_settings_updates_lm_studio_provider_fields() {
     assert!(cfg.local_ai.base_url.is_none());
     assert_eq!(cfg.local_ai.model_id, "");
     assert_eq!(cfg.local_ai.chat_model_id, "");
+}
+
+#[tokio::test]
+async fn apply_local_ai_settings_normalizes_ollama_unspecified_host_and_allows_null_clear() {
+    let tmp = tempdir().unwrap();
+    let mut cfg = tmp_config(&tmp);
+
+    apply_local_ai_settings(
+        &mut cfg,
+        LocalAiSettingsPatch {
+            provider: Some("ollama".into()),
+            base_url: Some(Some("http://0.0.0.0:11434/api/tags".into())),
+            ..LocalAiSettingsPatch::default()
+        },
+    )
+    .await
+    .expect("apply ollama base url");
+
+    assert_eq!(
+        cfg.local_ai.base_url.as_deref(),
+        Some("http://localhost:11434")
+    );
+
+    apply_local_ai_settings(
+        &mut cfg,
+        LocalAiSettingsPatch {
+            base_url: Some(None),
+            ..LocalAiSettingsPatch::default()
+        },
+    )
+    .await
+    .expect("clear ollama base url");
+
+    assert!(cfg.local_ai.base_url.is_none());
 }
 
 #[tokio::test]
@@ -1002,4 +1266,260 @@ async fn apply_screen_intelligence_settings_clamps_baseline_fps() {
     .await
     .expect("low clamp");
     assert!((cfg.screen_intelligence.baseline_fps - 0.2).abs() < f32::EPSILON);
+}
+
+// ── apply_autonomy_settings ────────────────────────────────────
+
+#[tokio::test]
+async fn apply_autonomy_settings_persists_max_actions_per_hour() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempdir().unwrap();
+    let mut cfg = tmp_config(&tmp);
+    let outcome = apply_autonomy_settings(
+        &mut cfg,
+        AutonomySettingsPatch {
+            max_actions_per_hour: Some(200),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("apply");
+    assert_eq!(cfg.autonomy.max_actions_per_hour, 200);
+    // Snapshot returned so the caller can echo the saved state.
+    assert!(outcome.value.get("config").is_some());
+    // Round-trip from disk: reload the saved TOML and confirm.
+    let on_disk = tokio::fs::read_to_string(&cfg.config_path).await.unwrap();
+    assert!(
+        on_disk.contains("max_actions_per_hour = 200"),
+        "expected TOML to contain max_actions_per_hour = 200, got:\n{on_disk}"
+    );
+}
+
+#[tokio::test]
+async fn apply_autonomy_settings_no_op_when_patch_empty() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempdir().unwrap();
+    let mut cfg = tmp_config(&tmp);
+    let prior = cfg.autonomy.max_actions_per_hour;
+    let _ = apply_autonomy_settings(
+        &mut cfg,
+        AutonomySettingsPatch {
+            max_actions_per_hour: None,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("apply noop");
+    assert_eq!(cfg.autonomy.max_actions_per_hour, prior);
+}
+
+#[tokio::test]
+async fn apply_autonomy_settings_rejects_zero() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempdir().unwrap();
+    let mut cfg = tmp_config(&tmp);
+    let err = apply_autonomy_settings(
+        &mut cfg,
+        AutonomySettingsPatch {
+            max_actions_per_hour: Some(0),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.contains("at least 1"),
+        "expected validation error, got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn apply_autonomy_settings_accepts_unlimited_sentinel() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // u32::MAX is the new "unlimited" sentinel exposed by the UI as a
+    // preset. The upper cap was lifted in the same PR that defaulted
+    // fresh installs to u32::MAX; anything in [1, u32::MAX] should now
+    // round-trip cleanly.
+    let tmp = tempdir().unwrap();
+    let mut cfg = tmp_config(&tmp);
+    apply_autonomy_settings(
+        &mut cfg,
+        AutonomySettingsPatch {
+            max_actions_per_hour: Some(u32::MAX),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("u32::MAX (unlimited) should round-trip");
+    assert_eq!(cfg.autonomy.max_actions_per_hour, u32::MAX);
+}
+
+#[tokio::test]
+async fn load_and_apply_autonomy_settings_roundtrip() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempdir().unwrap();
+    unsafe {
+        std::env::set_var("OPENHUMAN_WORKSPACE", tmp.path());
+    }
+
+    let patch = AutonomySettingsPatch {
+        max_actions_per_hour: Some(500),
+        ..Default::default()
+    };
+    let outcome = load_and_apply_autonomy_settings(patch)
+        .await
+        .expect("apply");
+    assert!(outcome.value.get("config").is_some());
+
+    // Reload from scratch and confirm the saved value sticks.
+    let reloaded = load_config_with_timeout().await.expect("reload");
+    assert_eq!(reloaded.autonomy.max_actions_per_hour, 500);
+
+    unsafe {
+        std::env::remove_var("OPENHUMAN_WORKSPACE");
+    }
+}
+
+#[tokio::test]
+async fn apply_autonomy_settings_replaces_auto_approve() {
+    // ENV_LOCK serializes the `live_policy::reload_from` triggered by
+    // `apply_autonomy_settings` against other live-policy-touching tests.
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempdir().unwrap();
+    let mut cfg = tmp_config(&tmp);
+    apply_autonomy_settings(
+        &mut cfg,
+        AutonomySettingsPatch {
+            auto_approve: Some(vec!["shell".into(), "curl".into()]),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("apply auto_approve");
+    assert_eq!(cfg.autonomy.auto_approve, vec!["shell", "curl"]);
+    // Persisted to the TOML, not just held in memory.
+    let on_disk = tokio::fs::read_to_string(&cfg.config_path).await.unwrap();
+    assert!(
+        on_disk.contains("auto_approve") && on_disk.contains("shell") && on_disk.contains("curl"),
+        "auto_approve allowlist should round-trip to TOML, got:\n{on_disk}"
+    );
+}
+
+#[tokio::test]
+async fn add_auto_approve_tool_appends_then_dedupes() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempdir().unwrap();
+    unsafe {
+        std::env::set_var("OPENHUMAN_WORKSPACE", tmp.path());
+    }
+
+    add_auto_approve_tool("git_operations")
+        .await
+        .expect("first add");
+    // Idempotent: a second add of the same tool must not create a duplicate.
+    add_auto_approve_tool("git_operations")
+        .await
+        .expect("second add (idempotent)");
+
+    let reloaded = load_config_with_timeout().await.expect("reload");
+    let hits = reloaded
+        .autonomy
+        .auto_approve
+        .iter()
+        .filter(|t| t.as_str() == "git_operations")
+        .count();
+    assert_eq!(
+        hits, 1,
+        "tool must appear exactly once after duplicate adds"
+    );
+
+    unsafe {
+        std::env::remove_var("OPENHUMAN_WORKSPACE");
+    }
+}
+
+// ── agent settings (action/tool timeout, issue #3100) ───────────────────────
+
+#[tokio::test]
+async fn apply_agent_settings_updates_timeout_and_persists_snapshot() {
+    // ENV_LOCK: `set_tool_timeout_secs` reads OPENHUMAN_TOOL_TIMEOUT_SECS and
+    // mutates the process-global timeout; serialize against other env-touching
+    // tests and ensure no operator override is masking the config value.
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    unsafe {
+        std::env::remove_var("OPENHUMAN_TOOL_TIMEOUT_SECS");
+    }
+    let tmp = tempdir().unwrap();
+    let mut cfg = tmp_config(&tmp);
+
+    let outcome = apply_agent_settings(
+        &mut cfg,
+        AgentSettingsPatch {
+            agent_timeout_secs: Some(300),
+        },
+    )
+    .await
+    .expect("apply agent settings");
+
+    assert_eq!(cfg.agent.agent_timeout_secs, 300);
+    assert_eq!(
+        outcome.value["config"]["agent"]["agent_timeout_secs"],
+        serde_json::json!(300)
+    );
+    assert!(outcome
+        .logs
+        .iter()
+        .any(|l| l.contains("agent settings saved to")));
+    // With no env override, the live runtime now reflects the saved value.
+    assert_eq!(
+        crate::openhuman::tool_timeout::tool_execution_timeout_secs(),
+        300
+    );
+}
+
+#[tokio::test]
+async fn apply_agent_settings_rejects_out_of_range_timeout() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempdir().unwrap();
+    let mut cfg = tmp_config(&tmp);
+    let original = cfg.agent.agent_timeout_secs;
+
+    // Zero would disable the timeout — rejected.
+    let err = apply_agent_settings(
+        &mut cfg,
+        AgentSettingsPatch {
+            agent_timeout_secs: Some(0),
+        },
+    )
+    .await
+    .expect_err("zero timeout should be rejected");
+    assert!(err.contains("between"), "unexpected error: {err}");
+
+    // Above the 3600s ceiling — rejected.
+    let err = apply_agent_settings(
+        &mut cfg,
+        AgentSettingsPatch {
+            agent_timeout_secs: Some(99_999),
+        },
+    )
+    .await
+    .expect_err("over-max timeout should be rejected");
+    assert!(err.contains("between"), "unexpected error: {err}");
+
+    // The config value is untouched after a rejected update.
+    assert_eq!(cfg.agent.agent_timeout_secs, original);
+}
+
+#[tokio::test]
+async fn apply_agent_settings_none_leaves_timeout_unchanged() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempdir().unwrap();
+    let mut cfg = tmp_config(&tmp);
+    cfg.agent.agent_timeout_secs = 250;
+
+    apply_agent_settings(&mut cfg, AgentSettingsPatch::default())
+        .await
+        .expect("apply no-op agent settings");
+
+    assert_eq!(cfg.agent.agent_timeout_secs, 250);
 }

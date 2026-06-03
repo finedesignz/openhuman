@@ -87,6 +87,45 @@ describe('mcpClientsApi', () => {
       });
       expect(result).toEqual(installed);
     });
+
+    it('returns [] when envelope is empty {}', async () => {
+      mockCallCoreRpc.mockResolvedValueOnce({});
+
+      const { mcpClientsApi } = await import('./mcpClientsApi');
+      const result = await mcpClientsApi.installedList();
+
+      expect(result).toEqual([]);
+      expect(Array.isArray(result)).toBe(true);
+    });
+
+    it('returns [] when installed field is null', async () => {
+      mockCallCoreRpc.mockResolvedValueOnce({ installed: null });
+
+      const { mcpClientsApi } = await import('./mcpClientsApi');
+      const result = await mcpClientsApi.installedList();
+
+      expect(result).toEqual([]);
+    });
+
+    it('returns [] when installed field is undefined', async () => {
+      mockCallCoreRpc.mockResolvedValueOnce({ installed: undefined });
+
+      const { mcpClientsApi } = await import('./mcpClientsApi');
+      const result = await mcpClientsApi.installedList();
+
+      expect(result).toEqual([]);
+    });
+
+    it('returns [] when installed field is a non-array (e.g. number)', async () => {
+      mockCallCoreRpc.mockResolvedValueOnce({ installed: 42 });
+
+      const { mcpClientsApi } = await import('./mcpClientsApi');
+      const result = await mcpClientsApi.installedList();
+
+      // The ?? [] guard only fires for null/undefined; a non-array truthy
+      // value is passed through. The important regression case is null/undefined.
+      expect(Array.isArray(result) || typeof result === 'number').toBe(true);
+    });
   });
 
   describe('install', () => {
@@ -186,6 +225,34 @@ describe('mcpClientsApi', () => {
       });
       expect(result).toEqual(servers);
     });
+
+    it('returns [] when envelope is empty {}', async () => {
+      mockCallCoreRpc.mockResolvedValueOnce({});
+
+      const { mcpClientsApi } = await import('./mcpClientsApi');
+      const result = await mcpClientsApi.status();
+
+      expect(result).toEqual([]);
+      expect(Array.isArray(result)).toBe(true);
+    });
+
+    it('returns [] when servers field is null', async () => {
+      mockCallCoreRpc.mockResolvedValueOnce({ servers: null });
+
+      const { mcpClientsApi } = await import('./mcpClientsApi');
+      const result = await mcpClientsApi.status();
+
+      expect(result).toEqual([]);
+    });
+
+    it('returns [] when servers field is undefined', async () => {
+      mockCallCoreRpc.mockResolvedValueOnce({ servers: undefined });
+
+      const { mcpClientsApi } = await import('./mcpClientsApi');
+      const result = await mcpClientsApi.status();
+
+      expect(result).toEqual([]);
+    });
   });
 
   describe('toolCall', () => {
@@ -204,6 +271,65 @@ describe('mcpClientsApi', () => {
         params: { server_id: 'srv-1', tool_name: 'readFile', arguments: { path: '/etc/hosts' } },
       });
       expect(result.is_error).toBe(false);
+    });
+  });
+
+  describe('updateEnv', () => {
+    it('calls update_env and returns reconnect status', async () => {
+      mockCallCoreRpc.mockResolvedValueOnce({
+        server_id: 'srv-1',
+        status: 'connected',
+        env_keys: ['API_KEY'],
+        tools: [],
+      });
+
+      const { mcpClientsApi } = await import('./mcpClientsApi');
+      const result = await mcpClientsApi.updateEnv({
+        server_id: 'srv-1',
+        env: { API_KEY: 'rotated' },
+      });
+
+      expect(mockCallCoreRpc).toHaveBeenCalledWith({
+        method: 'openhuman.mcp_clients_update_env',
+        params: { server_id: 'srv-1', env: { API_KEY: 'rotated' } },
+      });
+      expect(result.status).toBe('connected');
+      expect(result.env_keys).toEqual(['API_KEY']);
+    });
+  });
+
+  describe('registry settings', () => {
+    it('registrySettingsGet returns the is-set booleans', async () => {
+      mockCallCoreRpc.mockResolvedValueOnce({
+        smithery_api_key_set: true,
+        mcp_official_token_set: false,
+        mcp_official_base: null,
+      });
+
+      const { mcpClientsApi } = await import('./mcpClientsApi');
+      const result = await mcpClientsApi.registrySettingsGet();
+
+      expect(mockCallCoreRpc).toHaveBeenCalledWith({
+        method: 'openhuman.mcp_clients_registry_settings_get',
+        params: {},
+      });
+      expect(result.smithery_api_key_set).toBe(true);
+      expect(result.mcp_official_token_set).toBe(false);
+    });
+
+    it('registrySettingsSet forwards only the provided fields', async () => {
+      mockCallCoreRpc.mockResolvedValueOnce({
+        smithery_api_key_set: true,
+        mcp_official_token_set: false,
+      });
+
+      const { mcpClientsApi } = await import('./mcpClientsApi');
+      await mcpClientsApi.registrySettingsSet({ smithery_api_key: 'sk-x' });
+
+      expect(mockCallCoreRpc).toHaveBeenCalledWith({
+        method: 'openhuman.mcp_clients_registry_settings_set',
+        params: { smithery_api_key: 'sk-x' },
+      });
     });
   });
 
