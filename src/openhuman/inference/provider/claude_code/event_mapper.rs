@@ -157,13 +157,21 @@ impl EventMapper {
                 let call_id = block
                     .get("id")
                     .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
                 let tool_name = block
                     .get("name")
                     .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
+                if call_id.is_none() || tool_name.is_none() {
+                    log::warn!(
+                        "[claude-code][event-mapper] skipping tool_use block with missing id or name"
+                    );
+                    return Vec::new();
+                }
+                let call_id = call_id.unwrap();
+                let tool_name = tool_name.unwrap();
                 self.blocks.insert(
                     index,
                     BlockState {
@@ -258,6 +266,7 @@ impl EventMapper {
             },
             tool_calls: self.tool_calls,
             usage: self.usage,
+            reasoning_content: None,
         }
     }
 }
@@ -351,7 +360,10 @@ mod tests {
             total_cost_usd: Some(0.05),
             raw: Value::Null,
         });
-        let u = m.usage.as_ref().expect("usage synthesized for cost-only result");
+        let u = m
+            .usage
+            .as_ref()
+            .expect("usage synthesized for cost-only result");
         assert_eq!(u.input_tokens, 0);
         assert!((u.charged_amount_usd - 0.05).abs() < f64::EPSILON);
     }
