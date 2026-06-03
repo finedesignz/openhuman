@@ -7,11 +7,16 @@
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::sync::mpsc;
+
+/// Hard timeout per turn (PLAN §8). If the CLI hangs (network stall,
+/// infinite loop, MCP deadlock) we kill the child and surface a timeout.
+const TURN_TIMEOUT: Duration = Duration::from_secs(300);
 
 use super::event_mapper::EventMapper;
 use super::input_builder::build_stdin;
@@ -162,6 +167,13 @@ pub async fn run_turn(ctx: TurnContext<'_>) -> anyhow::Result<ChatResponse> {
     args.push("--disallowedTools".into());
     args.push(DISALLOWED_CC_BUILTINS.join(","));
 
+    // Validate input *before* spawning so we don't launch a process we
+    // can't feed (CodeRabbit: validate before spawn).
+    let stdin_bytes = build_stdin(ctx.messages, is_new);
+    if stdin_bytes.is_empty() {
+        anyhow::bail!("[claude-code][driver] no input messages to deliver");
+    }
+
     log::debug!(
         "[claude-code][driver] spawn bin={} model={} is_new={} cc_session_id={}",
         ctx.bin_path.display(),
@@ -175,7 +187,8 @@ pub async fn run_turn(ctx: TurnContext<'_>) -> anyhow::Result<ChatResponse> {
         .current_dir(&ctx.workspace_dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
     if let Some(key) = &ctx.anthropic_api_key {
         cmd.env("ANTHROPIC_API_KEY", key);
     }
@@ -183,12 +196,6 @@ pub async fn run_turn(ctx: TurnContext<'_>) -> anyhow::Result<ChatResponse> {
     let mut child = cmd
         .spawn()
         .map_err(|e| anyhow::anyhow!("failed to spawn `claude`: {e}"))?;
-
-    // Write stdin
-    let stdin_bytes = build_stdin(ctx.messages, is_new);
-    if stdin_bytes.is_empty() {
-        anyhow::bail!("[claude-code][driver] no input messages to deliver");
-    }
     if let Some(mut stdin) = child.stdin.take() {
         stdin
             .write_all(&stdin_bytes)
@@ -229,34 +236,57 @@ pub async fn run_turn(ctx: TurnContext<'_>) -> anyhow::Result<ChatResponse> {
         acc
     });
 
-    loop {
-        let n = stdout
-            .read(&mut buf)
-            .await
-            .map_err(|e| anyhow::anyhow!("read stdout: {e}"))?;
-        if n == 0 {
-            break;
+    // Wrap the streaming + wait in a timeout so a stuck CLI doesn't
+    // block this task forever (PLAN §8).
+    let timed = tokio::time::timeout(TURN_TIMEOUT, async {
+        loop {
+            let n = stdout
+                .read(&mut buf)
+                .await
+                .map_err(|e| anyhow::anyhow!("read stdout: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            for ev in parser.feed_bytes(&buf[..n]) {
+                for delta in mapper.handle(ev) {
+                    if let Some(tx) = ctx.stream {
+                        let _ = tx.send(delta).await;
+                    }
+                }
+            }
         }
-        for ev in parser.feed_bytes(&buf[..n]) {
+        for ev in parser.end() {
             for delta in mapper.handle(ev) {
                 if let Some(tx) = ctx.stream {
                     let _ = tx.send(delta).await;
                 }
             }
         }
-    }
-    for ev in parser.end() {
-        for delta in mapper.handle(ev) {
-            if let Some(tx) = ctx.stream {
-                let _ = tx.send(delta).await;
-            }
-        }
-    }
 
-    let status = child
-        .wait()
-        .await
-        .map_err(|e| anyhow::anyhow!("wait child: {e}"))?;
+        let status = child
+            .wait()
+            .await
+            .map_err(|e| anyhow::anyhow!("wait child: {e}"))?;
+        Ok::<_, anyhow::Error>(status)
+    })
+    .await;
+
+    let status = match timed {
+        Ok(inner) => inner?,
+        Err(_elapsed) => {
+            log::error!(
+                "[claude-code][driver] turn timeout ({TURN_TIMEOUT:?}) exceeded; killing child"
+            );
+            // kill_on_drop handles cleanup, but explicit kill gives us
+            // a chance to collect stderr.
+            let _ = child.kill().await;
+            anyhow::bail!(
+                "[claude-code][driver] turn timed out after {:?}",
+                TURN_TIMEOUT
+            );
+        }
+    };
+
     let stderr_text = stderr_task.await.unwrap_or_default();
 
     if !status.success() {
