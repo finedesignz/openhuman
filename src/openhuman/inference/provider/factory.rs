@@ -277,7 +277,13 @@ pub fn create_chat_provider_from_string(
     if let Some(model_with_temp) =
         p.strip_prefix(crate::openhuman::inference::provider::claude_code::PROVIDER_PREFIX)
     {
-        let (model, _temperature_override) = split_model_and_temperature(model_with_temp);
+        let (model, temperature_override) = split_model_and_temperature(model_with_temp);
+        if temperature_override.is_some() {
+            log::warn!(
+                "[providers][chat-factory] claude-code provider: per-model temperature override \
+                 is accepted but not yet wired through to the CLI — the @<temp> suffix is ignored"
+            );
+        }
         if model.is_empty() {
             anyhow::bail!(
                 "[chat-factory] provider string '{}' for role '{}' has an empty model — \

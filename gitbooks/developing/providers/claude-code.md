@@ -65,10 +65,12 @@ On exit non-zero the driver bubbles stderr (capped at 16 KiB) up as the error me
 
 ## Auth resolution order
 
-1. `ANTHROPIC_API_KEY` env var.
-2. Whatever the CLI itself reads from `~/.claude/.credentials.json` (we don't touch it).
+1. `ANTHROPIC_API_KEY` env var (highest precedence — set on the spawned child).
+2. Per-thread / per-agent key from `ChatRequest` config (future, not yet wired).
+3. `~/.claude/.credentials.json` — the CLI's own OAuth tokens from `claude login` (Pro / Max subscription). We never read or round-trip the access token; auth detection probes this file for non-secret metadata only.
+4. None — the CLI will fail with an auth error.
 
-Subscription / OAuth (Claude Pro / Max) lands in v2. v1.1 will wire OpenHuman's `AuthService` so a key stored in the AI settings panel is picked up automatically without rotating shell env.
+The `openhuman.inference_claude_code_auth_status` RPC probes sources 1 and 3 without spawning the CLI and surfaces the result in the Settings → AI panel.
 
 ## Tool surface exposed to the CLI
 

@@ -48,16 +48,15 @@ end tell"#;
 
     #[cfg(target_os = "linux")]
     {
-        for term in [
-            "x-terminal-emulator",
-            "gnome-terminal",
-            "konsole",
-            "xfce4-terminal",
-            "xterm",
-        ] {
-            // `-e <cmd>` is the conventional flag for all four. xterm and
-            // x-terminal-emulator additionally accept it.
-            match Command::new(term).args(["-e", "claude login"]).spawn() {
+        let terminals: &[(&str, &[&str])] = &[
+            ("x-terminal-emulator", &["-e", "claude", "login"]),
+            ("gnome-terminal", &["--", "claude", "login"]),
+            ("konsole", &["-e", "claude", "login"]),
+            ("xfce4-terminal", &["-e", "claude login"]),
+            ("xterm", &["-e", "claude", "login"]),
+        ];
+        for (term, args) in terminals {
+            match Command::new(term).args(*args).spawn() {
                 Ok(_) => return Ok(term.to_string()),
                 Err(_) => continue,
             }
