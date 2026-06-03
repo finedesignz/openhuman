@@ -144,15 +144,22 @@ impl ClaudeCodeProvider {
 /// Stable session key derived from the conversation's first user message.
 /// Best-effort — Phase 4 will plumb the real OpenHuman thread id through
 /// `ChatRequest`.
+///
+/// Uses SHA-256 (truncated) so the key is stable across Rust compiler
+/// versions (unlike `DefaultHasher` which may change between rustc
+/// releases, breaking persisted session lookups).
 fn thread_key_from_messages(messages: &[ChatMessage]) -> String {
+    use sha2::{Digest, Sha256};
     let first = messages
         .iter()
         .find(|m| m.role == "user")
         .map(|m| m.content.as_str())
         .unwrap_or("");
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    std::hash::Hash::hash(first, &mut hasher);
-    format!("hash_{:016x}", std::hash::Hasher::finish(&hasher))
+    let digest = Sha256::digest(first.as_bytes());
+    format!(
+        "hash_{:032x}",
+        u128::from_be_bytes(digest[..16].try_into().unwrap())
+    )
 }
 
 #[async_trait]
