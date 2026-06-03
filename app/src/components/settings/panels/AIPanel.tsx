@@ -1750,6 +1750,8 @@ function providerRefSignature(ref: ProviderRef): string {
       return `cloud:${ref.providerSlug}:${ref.model}:${ref.temperature ?? ''}`;
     case 'local':
       return `local:${ref.model}:${ref.temperature ?? ''}`;
+    case 'claude-code':
+      return `claude-code:${ref.model}:${ref.temperature ?? ''}`;
   }
 }
 
@@ -1969,7 +1971,9 @@ const CustomRoutingDialog = ({
     }
   };
 
-  const noProviders = customCloud.length === 0 && !localAvailable;
+  // Claude Code CLI is always available as a source — never show the
+  // empty state when it's the only option.
+  const noProviders = false;
 
   return (
     <div
@@ -2437,7 +2441,9 @@ const GlobalOwnModelSelector = ({
       ? null
       : source.kind === 'local'
         ? ({ kind: 'local', model: model.trim() } as const)
-        : ({ kind: 'cloud', providerSlug: source.providerSlug, model: model.trim() } as const);
+        : source.kind === 'claude-code'
+          ? ({ kind: 'claude-code', model: model.trim() } as const)
+          : ({ kind: 'cloud', providerSlug: source.providerSlug, model: model.trim() } as const);
   const isSaved =
     selectedRef !== null &&
     saved !== null &&
@@ -2449,6 +2455,8 @@ const GlobalOwnModelSelector = ({
     try {
       if (nextSource.kind === 'local') {
         await onApply({ kind: 'local', model: nextModel.trim() });
+      } else if (nextSource.kind === 'claude-code') {
+        await onApply({ kind: 'claude-code', model: nextModel.trim() });
       } else {
         await onApply({
           kind: 'cloud',
