@@ -234,9 +234,7 @@ function SignedOut() {
           Opens a terminal running <code>claude login</code>.
         </span>
       </div>
-      {launchError && (
-        <p className="text-xs text-rose-600 dark:text-rose-400">{launchError}</p>
-      )}
+      {launchError && <p className="text-xs text-rose-600 dark:text-rose-400">{launchError}</p>}
       <p className="text-xs text-neutral-500 dark:text-neutral-400">
         After completing login, click <strong>Recheck</strong> above. Alternatively set{' '}
         <code>ANTHROPIC_API_KEY</code> to use an API key.
