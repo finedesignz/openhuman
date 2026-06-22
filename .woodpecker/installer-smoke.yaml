@@ -1,0 +1,20 @@
+# Woodpecker CI — Linux installer-smoke leg ported from
+# .github/workflows/installer-smoke.yml (smoke-unix, ubuntu leg only).
+# The Windows install.ps1 leg is deliberately KEPT ON GitHub Actions: openhuman
+# is a PUBLIC repo and the Woodpecker Windows agent (TITANIUMTOWER) runs steps on
+# the owner's host shell via the local backend — never route public-PR pipelines
+# there. The macOS leg has no Woodpecker agent and stays on GitHub too.
+when:
+  - event: [push, pull_request]
+    branch: main
+
+labels:
+  platform: linux/amd64
+
+steps:
+  - name: smoke-unix
+    image: ubuntu:22.04
+    commands:
+      - apt-get update && apt-get install -y bash curl ca-certificates
+      - bash scripts/test_install.sh
+      - bash scripts/install.sh --dry-run --verbose
