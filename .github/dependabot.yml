@@ -14,6 +14,7 @@ version: 2
 # Security updates are unaffected -- Dependabot ignores `schedule` for those.
 updates:
   - package-ecosystem: "npm"
+    rebase-strategy: "disabled"
     directories:
       - "/"
       - "/app"
@@ -45,6 +46,7 @@ updates:
           - "*"
 
   - package-ecosystem: "cargo"
+    rebase-strategy: "disabled"
     directories:
       - "/"
       - "/app/src-tauri"
@@ -74,6 +76,7 @@ updates:
           - "*"
 
   - package-ecosystem: "docker"
+    rebase-strategy: "disabled"
     directories:
       - "/"
       - "/.github"
@@ -104,6 +107,7 @@ updates:
           - "*"
 
   - package-ecosystem: "github-actions"
+    rebase-strategy: "disabled"
     directory: "/"
     schedule:
       interval: "weekly"
